@@ -185,9 +185,11 @@ for _, className in ipairs(FARM_PLOT_CLASSES) do
     try(function()
         NotifyOnNewObject("/Script/Engine.Actor", function(actor)
             if not valid(actor) then return end
-            local cls = try(function() return actor:GetClass():GetName() end) or ""
+            -- GetName() crashes on nullptr class at construction time; use
+            -- GetFullName() + find() instead (same fix as other Dragonwilds mods).
+            local fullClass = try(function() return actor:GetClass():GetFullName() end) or ""
             for _, cn in ipairs(FARM_PLOT_CLASSES) do
-                if cls == cn then
+                if fullClass:find(cn) then
                     dbg("New plot detected — refreshing plot cache.")
                     ExecuteInGameThread(function() buildPlotCache() end)
                     return

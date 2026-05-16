@@ -1,0 +1,51 @@
+---@diagnostic disable: undefined-global
+
+local ModName = "[CooldownRemover] "
+
+function ModifyItem(asset,name,value)
+    local Item = StaticFindObject(asset)
+    if Item:IsValid() then
+        print("\n")
+        print(ModName .. "Asset: " .. asset .. "\n")
+        print(ModName .. "Previous " .. name .. ": " .. Item:GetPropertyValue(name) .. "\n")
+	    Item:SetPropertyValue(name, value)
+        print(ModName .. string.format("%s - %s: %d\n", asset, name, Item:GetPropertyValue(name)))
+        print(ModName .. "New " .. name .. ": " .. Item:GetPropertyValue(name) .. "\n")
+    else
+        print(ModName .. "Item not valid: " .. asset .. "\n")
+    end
+end
+
+RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, NewPawn)
+    ExecuteInGameThread(function()
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Rocksplosion/USD_Rocksplosion.USD_Rocksplosion", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/AccessPersonalChest/USD_AccessPersonalChest.USD_AccessPersonalChest", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/AxtralProjection/USD_AxtralProjection.USD_AxtralProjection", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/BonesToPeaches/USD_BonesToPeaches.USD_BonesToPeaches", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/CabbageRain/USD_CabbageRain.USD_CabbageRain", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Confuse/USD_Confuse.USD_Confuse", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/DetectOre/USD_DetectOre.USD_DetectOre", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/DetectOre/AlternativeRadar/USD_DetectOreAlt.USD_DetectOreAlt", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/EnchantChefsTools/USD_EnchantChefsTools.USD_EnchantChefsTools", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/EnchantWeapon/USD_EnchantWeapon_Air.USD_EnchantWeapon_Air", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/EnchantWeapon/USD_EnchantWeapon_Fire.USD_EnchantWeapon_Fire", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/EyeOfOculus/USD_EyeOfOculus.USD_EyeOfOculus", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/FerociousFurnace/USD_FerociousFurnace.USD_FerociousFurnace", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/FireSpirit/USD_FireSpirit.USD_FireSpirit", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/InternalAlchemy/USD_InternalAlchemy.USD_InternalAlchemy", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/MagicalMending/USD_MagicalMending.USD_MagicalMending", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/MagicFocus/USD_MagicFocus.USD_MagicFocus", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/RapidGrowth/USD_RapidGrowth.USD_RapidGrowth", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Splinter/USD_Splinter.USD_Splinter", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/SummonShelter/USD_SummonShelter.USD_SummonShelter", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Surge/USD_Surge.USD_Surge", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/TempestShield/USD_TempestShield.USD_TempestShield", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Treequipment/USD_Treequipment.USD_Treequipment", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Whetstone/USD_Whetstone.USD_Whetstone", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Windstep/USD_Windstep.USD_Windstep", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/CorruptionArrows/USD_CorruptionArrows.USD_CorruptionArrows", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Farming/USD_Harvest.USD_Harvest", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/Farming/Humidify/USD_Humidify.USD_Humidify", "CooldownDuration", 0)
+        ModifyItem("/Game/Gameplay/UtilityMagic/PerkSpells/SnareTrap/USD_SnareTrap.USD_SnareTrap", "CooldownDuration", 0)
+    end)
+end)

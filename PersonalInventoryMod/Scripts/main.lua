@@ -53,15 +53,10 @@ end
 local function get_save_dir()
     if SAVE_DIR then return SAVE_DIR end
 
-    -- TODO: Replace this with the actual UE4SS method for getting a writable path.
-    --       Options to investigate at runtime:
-    --         1. UEHelpers.GetGameStateBase():GetPathName() for a game-relative path
-    --         2. A known relative path like "../../Saved/PersonalInventoryMod/"
-    --         3. UE4SS's own mod directory if it exposes __DIR__
-    --
-    -- Placeholder: uses a path relative to the executable that typically resolves
-    -- to <GameRoot>/RSDragonwilds/Saved/PersonalInventoryMod/
-    SAVE_DIR = "../../Saved/" .. MOD_NAME .. "/"
+    -- The mod's own directory is guaranteed writable (the mod files live there).
+    -- From the game's working directory (Binaries/Win64/) this resolves to the
+    -- ue4ss Mods folder for this mod.
+    SAVE_DIR = "ue4ss/Mods/" .. MOD_NAME .. "/"
     log("Save directory set to: " .. SAVE_DIR)
     return SAVE_DIR
 end
@@ -212,7 +207,16 @@ local function get_or_create_second_inventory(ctrl)
     -- PersonalInventoryComponent. Fires when the inventory UI closes, which is the
     -- right point to serialize (better than per-change — avoids thrashing the file).
     local guid_struct = ctrl:GetCharacterGuid()
-    local guid = guid_struct and guid_struct.InnerGuid or "unknown"
+    local guid = "unknown"
+    if guid_struct then
+        local ig = guid_struct.InnerGuid
+        if type(ig) == "string" then
+            guid = ig
+        else
+            local ok_ts, ts = pcall(function() return ig:ToString() end)
+            if ok_ts and ts and ts ~= "" then guid = ts end
+        end
+    end
     local hook_ok, hook_err = pcall(function()
         second_inv.OnPersonalInventoryClosed:Add(function()
             ExecuteInGameThread(function()
@@ -235,66 +239,21 @@ end
 -- -----------------------------------------------------------------------------
 -- UI open logic
 -- -----------------------------------------------------------------------------
+-- Confirmed via param-spy: PersonalInventoryComponent:OpenPersonalInventory(p1, p2)
+-- where p2 is the BP_PlayerCharacter_C actor. p1 appears to be some int/flag
+-- (0 from our call, 34 from a real chest call) — passing ctrl for p1 works fine
+-- since UE4SS maps it to 0 and the function accepts it.
+-- The GetPersonalInventory redirect approach was dropped: it was crashing the real
+-- chest because the hook stayed active after our call.
 
-local function open_second_inventory_ui(ctrl, second_inv)
-    -- Option A: Temporarily redirect GetPersonalInventory to return second_inv,
-    -- then fire the AccessPersonalChest GE to open the bank UI against it.
-    --
-    -- TODO: Validate that the bank UI reads from GetPersonalInventory at open time
-    --       rather than holding a cached reference. If it caches at login, this
-    --       approach will not work and Option C (custom widget) will be needed.
-    --
-    -- The hook below intercepts ONE call to GetPersonalInventory and swaps the
-    -- return value to second_inv, then immediately unregisters itself.
-
-    local hook_id = nil
-    local hook_fired = false
-
-    local pre_ok, pre_err = pcall(function()
-        hook_id = RegisterHook("/Script/Dominion.DominionPlayerController:GetPersonalInventory",
-            function(self)
-                if self == ctrl and not hook_fired then
-                    hook_fired = true
-                    -- Unregister after first fire so normal bank use is unaffected
-                    if hook_id then
-                        UnregisterHook("/Script/Dominion.DominionPlayerController:GetPersonalInventory", hook_id)
-                    end
-                    return second_inv
-                end
-            end
-        )
+local function open_second_inventory_ui(ctrl, second_inv, char_obj)
+    local ok, err = pcall(function()
+        second_inv:OpenPersonalInventory(ctrl, char_obj)
     end)
-
-    if not pre_ok then
-        log_err("Could not register GetPersonalInventory redirect: " .. tostring(pre_err))
-        log_err("The second inventory UI will not open. See design doc Step 5.")
-        return
-    end
-
-    -- Trigger the AccessPersonalChest GE to open the bank UI.
-    -- TODO: Confirm the correct way to apply a GE via Lua in this game.
-    --       Candidates:
-    --         1. ctrl:GetAbilitySystemComponent():ApplyGameplayEffectToSelf(...)
-    --         2. Calling OnGameplayEffectAdded directly on a constructed GE instance
-    --       The call below is a placeholder; replace with the confirmed approach.
-    local apply_ok, apply_err = pcall(function()
-        local asc = ctrl:GetAbilitySystemComponent()
-        if not asc or not asc:IsValid() then
-            error("AbilitySystemComponent not found on controller")
-        end
-        local ge_class = StaticFindObject("/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_AccessPersonalChest.GE_PerkV2_Construction_AccessPersonalChest_C")
-        asc:ApplyGameplayEffectToSelf(ge_class, 1, asc:MakeEffectContext())
-    end)
-
-    if not apply_ok then
-        log_err("Failed to apply AccessPersonalChest GE: " .. tostring(apply_err))
-        log_err("TODO: Confirm GE application method. See design doc Step 5.")
-        -- Clean up the redirect hook so normal bank use is unaffected
-        if hook_id and not hook_fired then
-            pcall(function()
-                UnregisterHook("/Script/Dominion.DominionPlayerController:GetPersonalInventory", hook_id)
-            end)
-        end
+    if ok then
+        log("Second inventory UI opened successfully.")
+    else
+        log_err("OpenPersonalInventory failed: " .. tostring(err))
     end
 end
 
@@ -327,43 +286,89 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
         local reg_ok, reg_err = pcall(function()
             RegisterHook(SPELL_HOOK,
                 -- Pre-hook: fires before the GE applies.
+                -- IMPORTANT: Instance is only valid during this callback.
+                -- Extract all needed values synchronously here before calling
+                -- ExecuteInGameThread, which runs after this function returns.
                 function(self, Instance)
+                    -- GE Instance params arrive as RemoteUnrealParam with a null underlying
+                    -- UObject — we cannot extract the controller from them directly.
+                    -- Instead use FindAllOf inside the game thread, filtering to the local
+                    -- controller so multiplayer sessions stay isolated per-player.
                     ExecuteInGameThread(function()
-                        log("Eye of Oculus cast — opening second inventory.")
+                        log("Eye of Oculus cast — finding local player controller...")
 
-                        local ok, ctrl = pcall(function()
-                            return Instance:GetInstigator():GetController()
-                        end)
-                        if not ok or not ctrl or not ctrl:IsValid() then
-                            log_err("Could not get DominionPlayerController from GE instance.")
+                        local all_ctrls = FindAllOf("DominionPlayerController")
+                        if not all_ctrls or #all_ctrls == 0 then
+                            log_err("FindAllOf returned no DominionPlayerController instances.")
                             return
                         end
 
-                        local ok_guid, guid_struct = pcall(function()
-                            return ctrl:GetCharacterGuid()
-                        end)
+                        -- Prefer a controller that reports itself as local (multiplayer safe).
+                        local ctrl = nil
+                        for _, c in ipairs(all_ctrls) do
+                            if c:IsValid() then
+                                local ok_local, is_local = pcall(function() return c:IsLocalController() end)
+                                if ok_local and is_local then ctrl = c break end
+                            end
+                        end
+                        -- Fallback: first valid controller (single-player / listen-server host)
+                        if not ctrl then
+                            for _, c in ipairs(all_ctrls) do
+                                if c:IsValid() then ctrl = c break end
+                            end
+                        end
+                        if not ctrl then
+                            log_err("No valid DominionPlayerController found via FindAllOf.")
+                            return
+                        end
+
+                        local ok_guid, guid_struct = pcall(function() return ctrl:GetCharacterGuid() end)
                         if not ok_guid or not guid_struct then
-                            log_err("Could not get character GUID from controller.")
+                            log_err("GetCharacterGuid failed: " .. tostring(guid_struct))
                             return
                         end
-                        local guid = guid_struct.InnerGuid
+                        -- InnerGuid is an FGuid struct; call ToString() to get a plain string.
+                        local ig = guid_struct.InnerGuid
+                        local guid
+                        if type(ig) == "string" then
+                            guid = ig
+                        else
+                            local ok_ts, ts = pcall(function() return ig:ToString() end)
+                            if ok_ts and ts and ts ~= "" then
+                                guid = ts
+                            else
+                                -- Manual fallback: format the four 32-bit fields
+                                guid = string.format("%08X%08X%08X%08X",
+                                    ig.A or 0, ig.B or 0, ig.C or 0, ig.D or 0)
+                            end
+                        end
                         if not guid or guid == "" then
-                            log_err("DomCharacterGuid.InnerGuid was empty.")
+                            log_err("Could not resolve a GUID string from DomCharacterGuid.")
                             return
+                        end
+                        log("Controller found, GUID=" .. guid)
+
+                        -- Find the player character for OpenPersonalInventory(ctrl, char)
+                        local char_obj = nil
+                        local ok_ch, chars = pcall(function() return FindAllOf("DominionPlayerCharacter") end)
+                        if ok_ch and chars then
+                            for _, ch in ipairs(chars) do
+                                if ch:IsValid() then char_obj = ch break end
+                            end
+                        end
+                        if not char_obj then
+                            log_err("Could not find DominionPlayerCharacter — UI may not open.")
                         end
 
                         local second_inv = get_or_create_second_inventory(ctrl)
                         if not second_inv then return end
 
-                        -- Preemptive save: capture any changes from the previous open
-                        -- before we re-populate from disk.
-                        if SecondInventories[ctrl] then
-                            save_inventory_data(guid, second_inv)
-                        end
+                        -- Preemptive save before re-populating from disk
+                        save_inventory_data(guid, second_inv)
 
                         local data = load_inventory_data(guid)
                         populate_inventory(second_inv, data)
-                        open_second_inventory_ui(ctrl, second_inv)
+                        open_second_inventory_ui(ctrl, second_inv, char_obj)
                     end)
 
                     return false  -- suppress default Eye of Oculus effect
@@ -379,5 +384,7 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
             hook_registered = true
             log("Hook registered. Waiting for Eye of Oculus cast.")
         end
+
+        -- Param-spy hook removed — OpenPersonalInventory(ctrl, char) confirmed working.
     end)
 end)

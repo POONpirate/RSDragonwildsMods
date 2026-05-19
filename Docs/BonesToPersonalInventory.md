@@ -62,40 +62,38 @@ Whether the existing bank UI can be pointed at an arbitrary `PersonalInventoryCo
 
 ## Implementation Plan
 
-### Step 1 — Find the Bones to Peaches hook path
+### Step 1 — Find the Bones to Peaches hook path ✅
 
-We need the GE class name for Bones to Peaches so we can hook its `OnGameplayEffectAdded`. In FModel, navigate to:
+**Resolved.** `BP_PerkSpell_BonesToPeaches.uasset` confirmed the following:
 
-```
-RSDragonwilds > Content > Gameplay > UtilityMagic > PerkSpells
-```
-
-Look for a folder named something like `BonesToPeaches`, `Bones`, or `B2P`. Export:
-- The `USD_` spell data asset
-- The `GE_` gameplay effect it references
-
-From the GE asset, confirm:
-1. The full class name (e.g. `GE_PerkV2_Magic_BonesToPeaches_C`)
-2. That it has an `OnGameplayEffectAdded` function (all BP GEs do)
-3. What the default effect does (so we can decide whether to suppress it or run it alongside)
+- Class: `BP_PerkSpell_BonesToPeaches_C`, extends `UtilitySpell` (`/Script/Dominion`)
+- The spell is **not GE-based** — there is no `GE_` asset to hook
+- The bone-to-peach conversion is handled by an `ItemTransmuteSpellComponent` (`BoneToPeachesSpell`) attached to the spell actor
+- The hookable function is `ActivateGameplayEffects` (a Blueprint event, `FUNC_Event | FUNC_BlueprintEvent`)
+- Full hook path:
+  ```
+  /Game/Gameplay/UtilityMagic/PerkSpells/BonesToPeaches/BP_PerkSpell_BonesToPeaches.BP_PerkSpell_BonesToPeaches_C:ActivateGameplayEffects
+  ```
+- In the hook, `self` is the spell actor; the player controller is obtained via `self:GetInstigator():GetController()`
 
 ### Step 2 — Register the hook
 
+The spell is **not GE-based**. `BP_PerkSpell_BonesToPeaches_C` extends `UtilitySpell` and the bone conversion is handled by an `ItemTransmuteSpellComponent` attached to the actor. The correct hook target is the `ActivateGameplayEffects` Blueprint event, and `self` is the spell actor instance.
+
 ```lua
--- Hook path will be something like:
-RegisterHook("/Game/Gameplay/GameplayEffects/.../GE_BonesToPeaches.GE_BonesToPeaches_C:OnGameplayEffectAdded",
-    function(self, instance)
+RegisterHook(
+    "/Game/Gameplay/UtilityMagic/PerkSpells/BonesToPeaches/BP_PerkSpell_BonesToPeaches.BP_PerkSpell_BonesToPeaches_C:ActivateGameplayEffects",
+    function(self)
         ExecuteInGameThread(function()
-            -- our logic here
+            -- our logic here (get controller via self:GetInstigator():GetController())
         end)
+        -- returning false suppresses ActivateGameplayEffects, which prevents
+        -- ItemTransmuteSpellComponent from running the bone-to-peach conversion
+        return false
     end,
-    function(self, instance)
-        -- post-hook (optional)
-    end
+    function(self) end  -- post-hook unused
 )
 ```
-
-The pre-hook fires before the default GE logic. Returning false from a pre-hook suppresses the default. We'll decide in Step 1 whether to suppress the bones-to-peaches conversion or keep it.
 
 ### Step 3 — Get the controller and construct the second inventory component
 
@@ -212,12 +210,37 @@ The exact event/delegate name on `PersonalInventoryComponent` needs to be confir
 
 ---
 
-## Files Still Needed from FModel
+## Confirmed Properties (from runtime PropertyDumper)
 
-| File | Path | Why |
-|---|---|---|
-| Bones to Peaches USD | `Gameplay/UtilityMagic/PerkSpells/<B2P folder>/USD_*.uasset` | Get spell name and GE reference |
-| Bones to Peaches GE | `Gameplay/GameplayEffects/...` (path is in the USD) | Get hookable class name and `OnGameplayEffectAdded` signature |
+All unknowns are now resolved. Full class hierarchy of `PersonalInventoryComponent`:
+
+| Class | Property | Type | Notes |
+|---|---|---|---|
+| `PersonalInventoryComponent` | `OnPersonalInventoryClosed` | `MulticastInlineDelegateProperty` | Fires when inventory UI closes — used for save trigger |
+| `PersonalInventoryComponent` | `CachedPersonalChest` | `ObjectProperty` | Internal reference, not needed by mod |
+| `InventoryWithLogComponent` | `OnNewLogEvent` | `MulticastInlineDelegateProperty` | |
+| `InventoryWithLogComponent` | `LogEvents` | `ArrayProperty` | |
+| `InventoryWithLogComponent` | `IdGenerator` | `StructProperty` | |
+| `InventoryComponent` | `OnInventoryChanged` | `MulticastInlineDelegateProperty` | Fires on every item change |
+| `InventoryComponent` | `OnInventoryLoadedFromSave` | `MulticastInlineDelegateProperty` | Broadcast after loading from save to refresh UI |
+| `InventoryComponent` | `OnItemUsed` | `MulticastInlineDelegateProperty` | |
+| `InventoryComponent` | **`ItemSlots`** | `ArrayProperty` | **The items array** |
+| `InventoryComponent` | `PreviousItemSlots` | `ArrayProperty` | |
+| `InventoryComponent` | `MaxSlotCount` | `IntProperty` | Set to 40 at construction |
+| `InventoryComponent` | `bSupportsSortAndFillStacks` | `BoolProperty` | |
+| `InventoryComponent` | **`JsonInventory`** | `StrProperty` | **Engine's own JSON serialization of the inventory — read/write this directly for persistence** |
+
+### Key decisions from these findings
+
+- **Save trigger**: `OnPersonalInventoryClosed` (on close, not per-change) — avoids file thrashing
+- **Items array**: `ItemSlots` — used as fallback if `JsonInventory` is unavailable
+- **Persistence**: The engine already serializes inventory to `JsonInventory` as a string. We save this string to our JSON file and write it back on load via `SetPropertyValue("JsonInventory", ...)`, then broadcast `OnInventoryLoadedFromSave` to refresh the UI. This is far more reliable than manually reconstructing `ItemSlots`.
+
+### Confirmed from BP_BaseBuilding_PersonalChest
+
+- `DominionPlayerController:GetCharacterGuid()` — confirmed callable, returns a **`DomCharacterGuid` struct**. The usable string is in the `InnerGuid` field (e.g. `"00000000-00000000-00000000-00000000"`). Use `ctrl:GetCharacterGuid().InnerGuid` for JSON file naming.
+- `DominionPlayerController:GetPersonalInventory()` — confirmed callable, returns `PersonalInventoryComponent`.
+- The chest interaction also calls `GetCharacterDisplayName()` on the controller, available if needed.
 
 ---
 
@@ -240,6 +263,6 @@ RSDragonwildsMods/
 1. **Suppress or keep B2P default?** Does the player still want bones converted to peaches when they cast the spell, or should casting only open the second inventory?
 2. **UI redirection** — Can the bank UI be pointed at an arbitrary `PersonalInventoryComponent` instance, or is it hardcoded to the original? (See Step 5.) This determines whether we need a custom widget.
 3. **StaticConstructObject viability** — Does UE4SS's `StaticConstructObject` produce a component that can register with the inventory UI system, or will a different construction approach be needed?
-4. **Multiplayer**: Each player's second inventory is keyed by their own character GUID, so per-player separation should work correctly in multiplayer sessions the same way the regular bank does.
-5. **Exact property name** for items array on `PersonalInventoryComponent` — needs runtime inspection or further FModel digging.
-6. **Exact event/delegate name** for inventory changes on `PersonalInventoryComponent` — needs confirmation from a live instance.
+4. **Multiplayer**: Each player's second inventory is keyed by `DomCharacterGuid.InnerGuid` (confirmed available on `DominionPlayerController`), so per-player separation will work correctly in multiplayer sessions the same way the regular bank does.
+5. **Items array**: `ItemSlots` (`ArrayProperty` on `InventoryComponent`) — confirmed via runtime PropertyDumper. Superseded by `JsonInventory` approach.
+6. **Save delegate**: `OnPersonalInventoryClosed` (`MulticastInlineDelegateProperty` on `PersonalInventoryComponent`) — confirmed. `OnInventoryChanged` also available on `InventoryComponent` if per-change saving is ever needed.

@@ -1,35 +1,42 @@
 ---@diagnostic disable: undefined-global
 
 -- LargerHarvest - UE4SS Lua Mod
--- Increases the Harvest spell cast radius by 2.5x:
+-- Increases the Harvest (Uproot) spell radius by 2.5x:
 --   Base radius    : 750  -> 1875
 --   Upgraded radius: 1250 -> 3125
 --
--- The Harvest actor (BP_Magic_LiftAndSummonItems_C) is spawned fresh on each cast.
--- Its NiagaraComponent SCS fires before BeginPlay, giving us a window to scale
--- DefaultRadius and UpgradedRadius before GetNearbyHarvestablePlots reads them.
--- SetupSpellColliderSize (also in BeginPlay) then applies those scaled values to
--- the SpellCollider CapsuleComponent automatically.
+-- USD_Harvest is RF_Standalone (always in memory).
+-- SpellModule_Shape_0 holds two DominionShape_Sphere sub-objects that the
+-- Dominion framework reads for the harvest area. We patch their Radius via
+-- StaticFindObject on ClientRestart, exactly like LargerHumidify does.
 
 local ModName         = "[LargerHarvest] "
-local BASE_RADIUS     = 1875   -- was 750
-local UPGRADED_RADIUS = 3125   -- was 1250
+local BASE_RADIUS     = 1875.0   -- was 750
+local UPGRADED_RADIUS = 3125.0   -- was 1250
 
-NotifyOnNewObject("/Script/Niagara.NiagaraComponent", function(comp)
-    if not comp:IsValid() then return end
+local SPHERE_BASE     = "/Game/Gameplay/UtilityMagic/PerkSpells/Farming/USD_Harvest.USD_Harvest:SpellModule_Shape_0.DominionShape_Sphere_0"
+local SPHERE_UPGRADED = "/Game/Gameplay/UtilityMagic/PerkSpells/Farming/USD_Harvest.USD_Harvest:SpellModule_Shape_0.DominionShape_Sphere_1"
 
-    local ok, ownerClass = pcall(function() return comp:GetOuter():GetClass():GetFullName() end)
-    if not ok or not ownerClass:find("BP_Magic_LiftAndSummonItems") then return end
+local function patchSphere(path, targetRadius)
+    local sphere = StaticFindObject(path)
+    if not sphere or not sphere:IsValid() then
+        print(ModName .. "Sphere not found: " .. path .. "\n")
+        return
+    end
+    local ok, prev = pcall(function() return sphere:GetPropertyValue("Radius") end)
+    if not ok then
+        print(ModName .. "Could not read Radius from: " .. path .. "\n")
+        return
+    end
+    sphere:SetPropertyValue("Radius", targetRadius)
+    print(ModName .. "Radius: " .. tostring(prev) .. " -> " .. targetRadius .. "\n")
+end
 
-    local actor = comp:GetOuter()
-    if not actor or not actor:IsValid() then return end
-
-    -- Synchronous write: fires during SCS construction, before BeginPlay.
-    -- Both GetNearbyHarvestablePlots and SetupSpellColliderSize will read these.
-    pcall(function() actor:SetPropertyValue("DefaultRadius",  BASE_RADIUS) end)
-    pcall(function() actor:SetPropertyValue("UpgradedRadius", UPGRADED_RADIUS) end)
-
-    print(ModName .. "Radius scaled on new Harvest actor.\n")
+RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self)
+    ExecuteInGameThread(function()
+        patchSphere(SPHERE_BASE,     BASE_RADIUS)
+        patchSphere(SPHERE_UPGRADED, UPGRADED_RADIUS)
+    end)
 end)
 
 print(ModName .. "Loaded.\n")

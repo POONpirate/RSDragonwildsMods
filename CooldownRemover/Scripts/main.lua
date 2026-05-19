@@ -2,17 +2,22 @@
 
 local ModName = "[CooldownRemover] "
 
-function ModifyItem(asset,name,value)
-    local Item = StaticFindObject(asset)
-    if Item:IsValid() then
-        print("\n")
+function ModifyItem(asset, name, value)
+    local ok, err = pcall(function()
+        local Item = StaticFindObject(asset)
+        if not Item or not Item:IsValid() then
+            print(ModName .. "Item not valid: " .. asset .. "\n")
+            return
+        end
         print(ModName .. "Asset: " .. asset .. "\n")
-        print(ModName .. "Previous " .. name .. ": " .. Item:GetPropertyValue(name) .. "\n")
-	    Item:SetPropertyValue(name, value)
-        print(ModName .. string.format("%s - %s: %d\n", asset, name, Item:GetPropertyValue(name)))
-        print(ModName .. "New " .. name .. ": " .. Item:GetPropertyValue(name) .. "\n")
-    else
-        print(ModName .. "Item not valid: " .. asset .. "\n")
+        local prev = Item:GetPropertyValue(name)
+        Item:SetPropertyValue(name, value)
+        local curr = Item:GetPropertyValue(name)
+        print(ModName .. "Previous " .. name .. ": " .. tostring(prev) .. "\n")
+        print(ModName .. "New " .. name .. ": " .. tostring(curr) .. "\n")
+    end)
+    if not ok then
+        print(ModName .. "Error on " .. asset .. ": " .. tostring(err) .. "\n")
     end
 end
 

@@ -62,17 +62,19 @@ local function valid(obj)
 end
 
 local function refreshCoreCache()
-    -- Controller
+    -- If the controller is gone the whole world has changed (teleport/reload).
+    -- Wipe every cache entry so stale actors aren't used for server RPCs.
     if not valid(cache.ctrl) then
+        cache.ctrl     = nil
+        cache.player   = nil
+        cache.cmd      = nil
+        cache.perkComp = nil
+        cache.plots    = nil   -- forces plot rebuild for the new area
         local ctrls = FindAllOf("DominionPlayerController")
         if ctrls then
             for _, c in ipairs(ctrls) do
-                if valid(c) and try(function() return c:IsLocalController() end) then
-                    cache.ctrl = c break
-                end
-            end
-            if not cache.ctrl and ctrls[1] and valid(ctrls[1]) then
-                cache.ctrl = ctrls[1]
+                -- IsLocalController not exposed by UE4SS; just use first valid
+                if valid(c) then cache.ctrl = c break end
             end
         end
     end
@@ -82,12 +84,8 @@ local function refreshCoreCache()
         local ps = FindAllOf("DominionPlayerCharacter")
         if ps then
             for _, p in ipairs(ps) do
-                if valid(p) and try(function() return p:IsLocallyControlled() end) then
-                    cache.player = p break
-                end
-            end
-            if not cache.player and ps[1] and valid(ps[1]) then
-                cache.player = ps[1]
+                -- IsLocallyControlled not exposed by UE4SS; just use first valid
+                if valid(p) then cache.player = p break end
             end
         end
     end
@@ -108,8 +106,8 @@ local function refreshCoreCache()
         if perks then
             for _, p in ipairs(perks) do
                 if valid(p) then
-                    local name = try(function() return p:GetFullName() end) or ""
-                    if name:find("HumidifySpellUpgrade") then
+                    local name = try(function() return p:GetFullName() end)
+                    if type(name) == "string" and name:find("HumidifySpellUpgrade") then
                         cache.perk = p break
                     end
                 end
@@ -133,8 +131,8 @@ local function refreshBucketCache()
             if qty > 0 then
                 local cd = try(function() return item.Contents.ContentData end)
                 if valid(cd) then
-                    local name = try(function() return cd:GetFullName() end) or ""
-                    if name:find("Compost") then
+                    local name = try(function() return cd:GetFullName() end)
+                    if type(name) == "string" and name:find("Compost") then
                         cache.bucket = item
                         return
                     end
@@ -180,25 +178,13 @@ local function buildPlotCache()
     dbg(string.format("Plot cache built: %d plots", #plots))
 end
 
--- Auto-refresh plot cache when a farm plot is constructed
-for _, className in ipairs(FARM_PLOT_CLASSES) do
-    try(function()
-        NotifyOnNewObject("/Script/Engine.Actor", function(actor)
-            if not valid(actor) then return end
-            -- GetName() crashes on nullptr class at construction time; use
-            -- GetFullName() + find() instead (same fix as other Dragonwilds mods).
-            local fullClass = try(function() return actor:GetClass():GetFullName() end) or ""
-            for _, cn in ipairs(FARM_PLOT_CLASSES) do
-                if fullClass:find(cn) then
-                    dbg("New plot detected — refreshing plot cache.")
-                    ExecuteInGameThread(function() buildPlotCache() end)
-                    return
-                end
-            end
-        end)
-    end)
-    break  -- one hook is enough (covers all classes via the name check inside)
-end
+-- Note: the original NotifyOnNewObject("/Script/Engine.Actor") hook that
+-- auto-refreshed the plot cache on new plot construction was removed.
+-- Hooking all Actor spawns during level load (e.g. on teleport) causes a
+-- C++ crash when GetComponentByClass is called on mid-construction actors
+-- before Lua pcall can intercept it.  The cache is already cleared in
+-- refreshCoreCache() when the controller goes stale (every teleport), and
+-- onHumidifyCast() rebuilds it on the next cast — so the hook is not needed.
 
 -- ── Apply effects to one plot ─────────────────────────────────
 local function applyToPlot(plot, cmd, player, waterIndex, cleansingRain, done)

@@ -1,0 +1,103 @@
+[
+  {
+    "Type": "SpellModule_Cast",
+    "Name": "SpellModule_Cast_0",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'SpellModule_Cast'",
+    "Outer": {
+      "ObjectName": "UtilitySpellData'USD_EyeOfOculus'",
+      "ObjectPath": "/Game/Gameplay/UtilityMagic/PerkSpells/EyeOfOculus/USD_EyeOfOculus.4"
+    },
+    "Properties": {
+      "ModuleName": "Cast",
+      "Triggers": {
+        "PlayMontageRef": {
+          "ModuleName": "PlayMontage"
+        },
+        "AnimNotifyClass": {
+          "ObjectName": "BlueprintGeneratedClass'AnimNotify_AttackDamagePoint_C'",
+          "ObjectPath": "/Game/Gameplay/Character/Player/AnimNotifies/AnimNotify_AttackDamagePoint.1"
+        }
+      }
+    }
+  },
+  {
+    "Type": "SpellModule_CostItems",
+    "Name": "SpellModule_CostItems_0",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'SpellModule_CostItems'",
+    "Outer": {
+      "ObjectName": "UtilitySpellData'USD_EyeOfOculus'",
+      "ObjectPath": "/Game/Gameplay/UtilityMagic/PerkSpells/EyeOfOculus/USD_EyeOfOculus.4"
+    },
+    "Properties": {
+      "ItemsCostInfo": [
+        {
+          "ItemData": {
+            "ObjectName": "ItemData'ITEM_Rune_Astral'",
+            "ObjectPath": "/Game/Gameplay/Items/Resources/Magic/ITEM_Rune_Astral.0"
+          },
+          "Count": 3
+        }
+      ],
+      "bUseMagicAmmo": false,
+      "ModuleName": "CostItems"
+    }
+  },
+  {
+    "Type": "SpellModule_GameplayEffect",
+    "Name": "SpellModule_GameplayEffect_0",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'SpellModule_GameplayEffect'",
+    "Outer": {
+      "ObjectName": "UtilitySpellData'USD_EyeOfOculus'",
+      "ObjectPath": "/Game/Gameplay/UtilityMagic/PerkSpells/EyeOfOculus/USD_EyeOfOculus.4"
+    },
+    "Properties": {
+      "GameplayEffect": {
+        "ObjectName": "BlueprintGeneratedClass'GE_PerkV2_Construction_Oculus_C'",
+        "ObjectPath": "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.0"
+      },
+      "GameplayEffectSpellTarget": "EGameplayEffectSpellTarget::SpellOwner",
+      "bSkipCanBeDamagedCheck": true,
+      "ModuleName": "GameplayEffect",
+      "Triggers": {
+        "bHasStateTrigger": true,
+        "StateTrigger": "ESpellStateTrigger::FinishedCasting"
+      }
+    }
+  },
+  {
+    "Type": "SpellModule_PlayMontage",
+    "Name": "SpellModule_PlayMontage_0",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'SpellModule_PlayMontage'",
+    "Outer": {
+      "ObjectName": "UtilitySpellData'USD_EyeOfOculus'",
+      "ObjectPath": "/Game/Gameplay/UtilityMagic/PerkSpells/EyeOfOculus/USD_EyeOfOculus.4"
+    },
+    "Properties": {
+      "Montage": {
+        "ObjectName": "AnimMontage'AM_PlayerM_Sorcery_Spellcast_EyeofOculus'",
+        "ObjectPath": "/Game/Art/Animation/PlayerM/Sorcery/AM_PlayerM_Sorcery_Spellcast_EyeofOculus.0"
+      },
+      "bShouldRotateToCameraForward": false,
+      "ModuleName": "PlayMontage"
+    }
+  },
+  {
+    "Type": "UtilitySpellData",
+    "Name": "USD_EyeOfOculus",
+    "Flags": "RF_Public | RF_Standalone | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'UtilitySpellData'",
+    "Package": "/Game/Gameplay/UtilityMagic/PerkSpells/EyeOfOculus/USD_EyeOfOculus",
+    "Properties": {
+      "SpellDisplayName": {
+        "Namespace": "",
+        "Key": "B37AC21842DEF8DEC1265F83303F8094",
+        "SourceString": "Eye Of Oculus",
+        "LocalizedString": "Eye Of Oculus"
+      }
+    }
+  }
+]

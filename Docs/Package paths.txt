@@ -15,3 +15,7 @@ RSDragonwilds/Content/Gameplay/UtilityMagic/PerkSpells/AccessPersonalChest/USD_A
 RSDragonwilds/Content/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_AccessPersonalChest.uasset
 
 RSDragonwilds/Content/Gameplay/UtilityMagic/PerkSpells/BonestoPeaches/BP_PerkSpell_BonesToPeaches.uasset
+
+RSDragonwilds/Content/Gameplay/UtilityMagic/PerkSpells/EyeOfOculus/USD_EyeOfOculus.uasset
+
+RSDragonwilds/Content/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.uasset

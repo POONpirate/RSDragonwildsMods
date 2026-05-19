@@ -2,7 +2,7 @@
 
 ## Goal
 
-Hook the **Bones to Peaches** spell so that casting it opens a **second, separate personal inventory** — completely independent of the existing bank/Personal Chest. This second inventory has 40 slots and leaves the regular `PersonalInventoryComponent` untouched. Its contents are serialized to a **JSON file keyed by character GUID** on every change. Because persistence lives in the JSON file rather than the game's save system, items survive mod removal and re-appear automatically when the mod is re-enabled.
+Hook the **Eye of Oculus** spell so that casting it opens a **second, separate personal inventory** — completely independent of the existing bank/Personal Chest. This second inventory has 40 slots and leaves the regular `PersonalInventoryComponent` untouched. Its contents are serialized to a **JSON file keyed by character GUID** on every change. Because persistence lives in the JSON file rather than the game's save system, items survive mod removal and re-appear automatically when the mod is re-enabled.
 
 ---
 
@@ -62,36 +62,34 @@ Whether the existing bank UI can be pointed at an arbitrary `PersonalInventoryCo
 
 ## Implementation Plan
 
-### Step 1 — Find the Bones to Peaches hook path ✅
+### Step 1 — Find the spell hook path ✅
 
-**Resolved.** `BP_PerkSpell_BonesToPeaches.uasset` confirmed the following:
+**Resolved.** `USD_EyeOfOculus.uasset` confirmed the following:
 
-- Class: `BP_PerkSpell_BonesToPeaches_C`, extends `UtilitySpell` (`/Script/Dominion`)
-- The spell is **not GE-based** — there is no `GE_` asset to hook
-- The bone-to-peach conversion is handled by an `ItemTransmuteSpellComponent` (`BoneToPeachesSpell`) attached to the spell actor
-- The hookable function is `ActivateGameplayEffects` (a Blueprint event, `FUNC_Event | FUNC_BlueprintEvent`)
+- The spell is **GE-based**: `SpellModule_GameplayEffect` fires `GE_PerkV2_Construction_Oculus_C` at `ESpellStateTrigger::FinishedCasting`
+- GE package path: `/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus`
 - Full hook path:
   ```
-  /Game/Gameplay/UtilityMagic/PerkSpells/BonesToPeaches/BP_PerkSpell_BonesToPeaches.BP_PerkSpell_BonesToPeaches_C:ActivateGameplayEffects
+  /Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded
   ```
-- In the hook, `self` is the spell actor; the player controller is obtained via `self:GetInstigator():GetController()`
+- In the hook, `self` is the GE CDO and `instance` is the active GE spec; the player controller is obtained via `instance:GetInstigator():GetController()`
+- Costs 3 Astral Runes per cast (`SpellModule_CostItems`)
 
 ### Step 2 — Register the hook
 
-The spell is **not GE-based**. `BP_PerkSpell_BonesToPeaches_C` extends `UtilitySpell` and the bone conversion is handled by an `ItemTransmuteSpellComponent` attached to the actor. The correct hook target is the `ActivateGameplayEffects` Blueprint event, and `self` is the spell actor instance.
+Eye of Oculus is GE-based. We hook `OnGameplayEffectAdded` on `GE_PerkV2_Construction_Oculus_C`. `self` is the GE CDO; `instance` is the active spec. The player controller comes from `instance:GetInstigator():GetController()`. Returning false suppresses the default GE effect.
 
 ```lua
 RegisterHook(
-    "/Game/Gameplay/UtilityMagic/PerkSpells/BonesToPeaches/BP_PerkSpell_BonesToPeaches.BP_PerkSpell_BonesToPeaches_C:ActivateGameplayEffects",
-    function(self)
+    "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded",
+    function(self, instance)
         ExecuteInGameThread(function()
-            -- our logic here (get controller via self:GetInstigator():GetController())
+            local ctrl = instance:GetInstigator():GetController()
+            -- our logic here
         end)
-        -- returning false suppresses ActivateGameplayEffects, which prevents
-        -- ItemTransmuteSpellComponent from running the bone-to-peach conversion
-        return false
+        return false  -- suppress default Eye of Oculus effect
     end,
-    function(self) end  -- post-hook unused
+    function(self, instance) end  -- post-hook unused
 )
 ```
 
@@ -260,7 +258,7 @@ RSDragonwildsMods/
 
 ## Open Questions
 
-1. **Suppress or keep B2P default?** Does the player still want bones converted to peaches when they cast the spell, or should casting only open the second inventory?
+1. **Suppress Eye of Oculus default?** The default GE effect is currently suppressed (return false). Confirm whether the original Eye of Oculus effect should also fire or be replaced entirely.
 2. **UI redirection** — Can the bank UI be pointed at an arbitrary `PersonalInventoryComponent` instance, or is it hardcoded to the original? (See Step 5.) This determines whether we need a custom widget.
 3. **StaticConstructObject viability** — Does UE4SS's `StaticConstructObject` produce a component that can register with the inventory UI system, or will a different construction approach be needed?
 4. **Multiplayer**: Each player's second inventory is keyed by `DomCharacterGuid.InnerGuid` (confirmed available on `DominionPlayerController`), so per-player separation will work correctly in multiplayer sessions the same way the regular bank does.

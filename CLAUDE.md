@@ -1,0 +1,3 @@
+We're going to be working on the mod concept in Docs/BonesToPersonalInventory.md.
+Before building the mod we're going to work on the concept first trying to flush out the idea.
+Ideally we want a seperate second personal inventory, we want it to have more then 20 slots, and we want it to persist on the character save similar to the regular personal inventory to ensure it never get's deleted if the mod is removed or if the character changes worlds.

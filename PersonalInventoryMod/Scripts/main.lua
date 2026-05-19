@@ -14,10 +14,11 @@ local json = require("json")
 local MOD_NAME       = "PersonalInventoryMod"
 local SECOND_INV_SLOTS = 40
 
--- Hook path confirmed from BP_PerkSpell_BonesToPeaches.uasset.
--- The spell is NOT GE-based — it extends UtilitySpell and fires ActivateGameplayEffects
--- when cast. The ItemTransmuteSpellComponent on the actor handles the bone conversion.
-local B2P_HOOK = "/Game/Gameplay/UtilityMagic/PerkSpells/BonesToPeaches/BP_PerkSpell_BonesToPeaches.BP_PerkSpell_BonesToPeaches_C:ActivateGameplayEffects"
+-- Hook path derived from USD_EyeOfOculus.uasset.
+-- Eye of Oculus is GE-based: SpellModule_GameplayEffect fires GE_PerkV2_Construction_Oculus_C
+-- at ESpellStateTrigger::FinishedCasting. We hook OnGameplayEffectAdded on the GE class.
+-- 'instance' in the hook is the GE spec; get the controller via instance:GetInstigator():GetController().
+local SPELL_HOOK = "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded"
 
 -- JSON save files are written to the game's Saved/ directory, one file per character GUID.
 -- UE4SS exposes the project directory via GetKismetSystemLibrary or a known relative path.
@@ -106,21 +107,18 @@ local function load_inventory_data(guid)
 end
 
 local function save_inventory_data(guid, inv_comp)
-    -- The game has a built-in JsonInventory StrProperty on InventoryComponent.
-    -- Try reading that first — if it's populated, it's the most reliable source
-    -- since the engine itself serialized it. Fall back to reading ItemSlots manually.
+    if not inv_comp or not inv_comp:IsValid() then return end
 
     local path = json_path(guid)
     local file = io.open(path, "w")
     if not file then
         log_err("Could not open save file for writing: " .. path)
-        log_err("Make sure the directory exists: " .. get_save_dir())
         return
     end
 
-    -- Approach A: use the engine's own JsonInventory string
+    -- Read JsonInventory using confirmed method: GetPropertyValue():ToString()
     local ok_json, json_str = pcall(function()
-        return inv_comp:GetPropertyValue("JsonInventory")
+        return inv_comp:GetPropertyValue("JsonInventory"):ToString()
     end)
     if ok_json and json_str and json_str ~= "" then
         file:write(json_str)
@@ -129,34 +127,8 @@ local function save_inventory_data(guid, inv_comp)
         return
     end
 
-    -- Approach B: read ItemSlots array manually
-    -- ItemSlots is the confirmed ArrayProperty on InventoryComponent.
-    -- Slot entry property names (Quantity, ItemData path) need runtime confirmation.
-    local ok_slots, slots = pcall(function()
-        return inv_comp:GetPropertyValue("ItemSlots")
-    end)
-    if not ok_slots or not slots then
-        log_err("Could not read ItemSlots for GUID " .. guid)
-        file:close()
-        return
-    end
-
-    local data = {}
-    for i = 1, #slots do
-        local slot = slots[i]
-        -- TODO: Confirm slot entry property names via PropertyDumper on an ItemSlots element.
-        --       Likely candidates for item reference: ItemData, ItemDef, ItemClass
-        --       Likely candidates for count: Quantity, Count, StackCount
-        table.insert(data, {
-            itemData  = tostring(slot.ItemData  or slot.ItemDef or ""),
-            quantity  = slot.Quantity or slot.Count or 0,
-            slotIndex = i,
-        })
-    end
-
-    file:write(json.encode(data))
     file:close()
-    log("Saved " .. #data .. " slot(s) via ItemSlots for GUID " .. guid)
+    log_err("JsonInventory was empty or unreadable for GUID " .. guid .. " — nothing saved.")
 end
 
 -- -----------------------------------------------------------------------------
@@ -166,7 +138,7 @@ end
 local function populate_inventory(inv_comp, data)
     if not data or (type(data) == "table" and #data == 0) then return end
 
-    -- Approach A: if data is a string, it came from JsonInventory — write it back directly.
+    -- data is a plain Lua string saved from JsonInventory:ToString() — write it back directly.
     if type(data) == "string" and data ~= "" then
         local ok, err = pcall(function()
             inv_comp:SetPropertyValue("JsonInventory", data)
@@ -327,75 +299,85 @@ local function open_second_inventory_ui(ctrl, second_inv)
 end
 
 -- -----------------------------------------------------------------------------
--- Bones to Peaches hook
+-- Eye of Oculus hook
 -- -----------------------------------------------------------------------------
 
--- The spell is BP_PerkSpell_BonesToPeaches_C, a UtilitySpell actor.
--- ActivateGameplayEffects is the Blueprint event that triggers when the spell fires.
--- 'self' in the hook is the spell actor instance.
--- Returning false from the pre-hook suppresses the ActivateGameplayEffects event,
--- which prevents the ItemTransmuteSpellComponent from running the bone conversion.
+-- GE_PerkV2_Construction_Oculus_C is a Blueprint GE with DurationType::Infinite.
+-- Its Blueprint class is not loaded at mod startup — only once the player is in-world
+-- and the asset gets streamed in. We defer RegisterHook to NotifyOnNewObject so that
+-- by the time we try to hook, the class is guaranteed to exist in memory.
+--
+-- 'self' in the pre-hook is the GE data CDO.
+-- 'Instance' (capital I, per the asset) is the active DominionGameplayEffect.
+-- Returning false suppresses the default Eye of Oculus effect entirely.
 
-log("Registering Bones to Peaches hook...")
-log("Hook path: " .. B2P_HOOK)
+log("Waiting for player controller to register Eye of Oculus hook...")
 
-local reg_ok, reg_err = pcall(function()
-    RegisterHook(B2P_HOOK,
-        -- Pre-hook: fires before ActivateGameplayEffects runs. Return false to suppress
-        -- the bone-to-peach conversion entirely.
-        function(self)
-            ExecuteInGameThread(function()
-                log("Bones to Peaches cast — opening second inventory.")
+local hook_registered = false
 
-                -- self is the BP_PerkSpell_BonesToPeaches_C spell actor.
-                -- Get the instigator (player pawn) then their controller.
-                local ok, ctrl = pcall(function()
-                    return self:GetInstigator():GetController()
-                end)
-                if not ok or not ctrl or not ctrl:IsValid() then
-                    log_err("Could not get DominionPlayerController from spell actor.")
-                    return
-                end
+NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
+    if hook_registered then return end
 
-                -- Get the character GUID for JSON keying.
-                -- GetCharacterGuid() returns a DomCharacterGuid struct, not a plain string.
-                -- We read its InnerGuid field to get a stable string for the filename.
-                local ok_guid, guid_struct = pcall(function()
-                    return ctrl:GetCharacterGuid()
-                end)
-                if not ok_guid or not guid_struct then
-                    log_err("Could not get character GUID from controller.")
-                    return
-                end
-                local guid = guid_struct.InnerGuid
-                if not guid or guid == "" then
-                    log_err("DomCharacterGuid.InnerGuid was empty — cannot key save file.")
-                    return
-                end
+    ExecuteInGameThread(function()
+        if hook_registered then return end
 
-                -- Get or construct the second inventory component
-                local second_inv = get_or_create_second_inventory(ctrl)
-                if not second_inv then return end
+        log("Player controller ready — registering Eye of Oculus hook...")
+        log("Hook path: " .. SPELL_HOOK)
 
-                -- Load saved items and populate the component
-                local data = load_inventory_data(guid)
-                populate_inventory(second_inv, data)
+        local reg_ok, reg_err = pcall(function()
+            RegisterHook(SPELL_HOOK,
+                -- Pre-hook: fires before the GE applies.
+                function(self, Instance)
+                    ExecuteInGameThread(function()
+                        log("Eye of Oculus cast — opening second inventory.")
 
-                -- Open the bank UI pointed at the second inventory
-                open_second_inventory_ui(ctrl, second_inv)
-            end)
+                        local ok, ctrl = pcall(function()
+                            return Instance:GetInstigator():GetController()
+                        end)
+                        if not ok or not ctrl or not ctrl:IsValid() then
+                            log_err("Could not get DominionPlayerController from GE instance.")
+                            return
+                        end
 
-            -- Return false to suppress the default bones-to-peaches conversion
-            return false
-        end,
+                        local ok_guid, guid_struct = pcall(function()
+                            return ctrl:GetCharacterGuid()
+                        end)
+                        if not ok_guid or not guid_struct then
+                            log_err("Could not get character GUID from controller.")
+                            return
+                        end
+                        local guid = guid_struct.InnerGuid
+                        if not guid or guid == "" then
+                            log_err("DomCharacterGuid.InnerGuid was empty.")
+                            return
+                        end
 
-        -- Post-hook (unused for now)
-        function(self) end
-    )
+                        local second_inv = get_or_create_second_inventory(ctrl)
+                        if not second_inv then return end
+
+                        -- Preemptive save: capture any changes from the previous open
+                        -- before we re-populate from disk.
+                        if SecondInventories[ctrl] then
+                            save_inventory_data(guid, second_inv)
+                        end
+
+                        local data = load_inventory_data(guid)
+                        populate_inventory(second_inv, data)
+                        open_second_inventory_ui(ctrl, second_inv)
+                    end)
+
+                    return false  -- suppress default Eye of Oculus effect
+                end,
+
+                function(self, Instance) end  -- post-hook unused
+            )
+        end)
+
+        if not reg_ok then
+            log_err("Failed to register Eye of Oculus hook: " .. tostring(reg_err))
+        else
+            hook_registered = true
+            log("Hook registered. Waiting for Eye of Oculus cast.")
+        end
+    end)
 end)
-
-if not reg_ok then
-    log_err("Failed to register B2P hook: " .. tostring(reg_err))
-else
-    log("Hook registered. Waiting for Bones to Peaches cast.")
-end

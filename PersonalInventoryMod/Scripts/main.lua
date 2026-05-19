@@ -39,11 +39,11 @@ local SecondInventories = {}
 -- -----------------------------------------------------------------------------
 
 local function log(msg)
-    print(string.format("[%s] %s", MOD_NAME, msg))
+    print(string.format("[%s] %s\n", MOD_NAME, msg))
 end
 
 local function log_err(msg)
-    print(string.format("[%s] ERROR: %s", MOD_NAME, msg))
+    print(string.format("[%s] ERROR: %s\n", MOD_NAME, msg))
 end
 
 -- -----------------------------------------------------------------------------

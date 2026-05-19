@@ -203,7 +203,7 @@ The exact event/delegate name on `PersonalInventoryComponent` needs to be confir
 
 ```
 RSDragonwildsMods/
-└─ BonesToPersonalInventory/
+└─ PersonalInventoryMod/
    ├─ Scripts/
    │   ├─ main.lua
    │   └─ json.lua          (tiny pure-Lua JSON lib, if needed)
@@ -216,7 +216,7 @@ RSDragonwildsMods/
 ## Open Questions
 
 1. **Suppress or keep B2P default?** Does the player still want bones converted to peaches when they cast the spell, or should casting only open the bank?
-2. **Slot count**: `PersonalInventoryComponent.MaxSlotCount` is 20 by default. Can we raise it via `SetPropertyValue` at startup? (Probably yes, same pattern as radius mods.)
+2. **Slot count**: The second inventory will have **40 slots**. `PersonalInventoryComponent.MaxSlotCount` is 20 by default and will be raised to 40 via `SetPropertyValue` at startup (same pattern as radius mods).
 3. **Multiplayer**: `GetPersonalInventory()` is called on the local player's controller. In a multiplayer session, each player's bank is separate — this should work correctly per-player as long as JSON is keyed by player GUID (available via `GetCharacterGuid()` seen in the PersonalChest BP).
 4. **Exact property name** for items array on `PersonalInventoryComponent` — needs runtime inspection or further FModel digging.
 5. **Exact UFunction name** for opening the bank UI from Lua — confirmed it goes through `GetPersonalInventory` but the UI-open call may be native C++ after that.

@@ -283,12 +283,45 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
         log("Player controller ready — registering Eye of Oculus hook...")
         log("Hook path: " .. SPELL_HOOK)
 
+        -- Suppress OculusComponent:ActivateOculus so Eye of Oculus never opens the
+        -- build menu. Eye of Oculus now exclusively opens the second inventory.
+        -- This is a native hook so return false in the pre-hook reliably cancels it.
+        -- ActivateOculus: log pre AND post to determine if return false actually
+        -- suppresses the function (if post fires, suppression is not working).
+        -- ActivateOculus fires during the blueprint body of OnGameplayEffectAdded.
+        -- return false does NOT suppress native hooks in this UE4SS build.
+        -- Instead we call DeactivateOculus from the post-hook to close the build menu
+        -- immediately after it opens, leaving only our second inventory visible.
+        local ok_oa, err_oa = pcall(function()
+            RegisterHook("/Script/Dominion.OculusComponent:ActivateOculus",
+                function(self) end,  -- pre-hook: no-op
+                function(self)
+                    -- Post-hook: build menu just opened. Get the OculusComponent and
+                    -- deactivate it so the build menu closes before the player sees it.
+                    local ok_get, comp = pcall(function() return self:get() end)
+                    if not ok_get or not comp then
+                        log_err("ActivateOculus post: self:get() failed: " .. tostring(comp))
+                        return
+                    end
+                    local ok_d, err_d = pcall(function() comp:DeactivateOculus() end)
+                    if ok_d then
+                        log("Build menu closed via DeactivateOculus.")
+                    else
+                        log_err("DeactivateOculus failed: " .. tostring(err_d))
+                    end
+                end
+            )
+        end)
+        if ok_oa then
+            log("OculusComponent:ActivateOculus hook registered.")
+        else
+            log_err("Could not hook ActivateOculus: " .. tostring(err_oa))
+        end
+
         local reg_ok, reg_err = pcall(function()
             RegisterHook(SPELL_HOOK,
-                -- Pre-hook: fires before the GE applies.
-                -- IMPORTANT: Instance is only valid during this callback.
-                -- Extract all needed values synchronously here before calling
-                -- ExecuteInGameThread, which runs after this function returns.
+                -- Pre-hook: opens the second inventory before the GE blueprint body runs.
+                -- ActivateOculus is now suppressed so the build menu will not open.
                 function(self, Instance)
                     -- GE Instance params arrive as RemoteUnrealParam with a null underlying
                     -- UObject — we cannot extract the controller from them directly.
@@ -370,8 +403,6 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                         populate_inventory(second_inv, data)
                         open_second_inventory_ui(ctrl, second_inv, char_obj)
                     end)
-
-                    return false  -- suppress default Eye of Oculus effect
                 end,
 
                 function(self, Instance) end  -- post-hook unused

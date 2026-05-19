@@ -2,7 +2,7 @@
 
 ## Goal
 
-Hook the **Bones to Peaches** spell so that casting it opens the player's Personal Chest (bank) UI instead of — or in addition to — its default effect. The bank's contents are serialized to a **JSON file** on every change, making items persist independently of the game's save system. If the mod is disabled, items survive in the JSON and re-appear when the mod is re-enabled.
+Hook the **Bones to Peaches** spell so that casting it opens a **second, separate personal inventory** — completely independent of the existing bank/Personal Chest. This second inventory has 40 slots and leaves the regular `PersonalInventoryComponent` untouched. Its contents are serialized to a **JSON file keyed by character GUID** on every change. Because persistence lives in the JSON file rather than the game's save system, items survive mod removal and re-appear automatically when the mod is re-enabled.
 
 ---
 
@@ -43,17 +43,20 @@ The **Personal Chest building** (`BP_BaseBuilding_PersonalChest_C`) does exactly
 
 ## Chosen Architecture
 
-### Why reuse the bank (PersonalInventoryComponent)
+### A second PersonalInventoryComponent + JSON persistence
 
-- No chest actor needs to exist in the world
-- No spawning required — the component already lives on `DominionPlayerController`
-- The bank UI is already wired to open with this component
-- `InventoryChangedEvent` (or equivalent) gives us a hook to serialize on every change
-- Items in the component are also saved by the game's own save system as a secondary backup
+A second `PersonalInventoryComponent` is created dynamically at runtime using UE4SS's `StaticConstructObject` pattern and attached to `DominionPlayerController`. This keeps it entirely separate from the existing bank component — the regular Personal Chest building and `AccessPersonalChest` spell continue to use the original component without any interference.
 
-### Trade-off
+Key points:
+- The second component only exists while the mod is active, so it cannot rely on the game's own save system
+- All item data is written to a **JSON file keyed by character GUID** (`GetCharacterGuid()`) on every inventory change
+- On load, the JSON is read and used to populate the second component before the UI opens
+- If the mod is disabled, the JSON file remains on disk untouched — re-enabling the mod restores all items exactly as left
+- `MaxSlotCount` is set to **40** via `SetPropertyValue` immediately after the component is constructed
 
-Bones to Peaches and the Physical Personal Chest building will share the same storage. If the player wants to keep them separate they'd need a different trigger. For now this is the agreed approach.
+### Open research question
+
+Whether the existing bank UI can be pointed at an arbitrary `PersonalInventoryComponent` instance (rather than the one already registered on the controller) is still to be confirmed. If the UI is hardcoded to the original component, we will need a different open trigger or a custom UI widget.
 
 ---
 
@@ -94,9 +97,9 @@ RegisterHook("/Game/Gameplay/GameplayEffects/.../GE_BonesToPeaches.GE_BonesToPea
 
 The pre-hook fires before the default GE logic. Returning false from a pre-hook suppresses the default. We'll decide in Step 1 whether to suppress the bones-to-peaches conversion or keep it.
 
-### Step 3 — Get the player's PersonalInventoryComponent
+### Step 3 — Get the controller and construct the second inventory component
 
-Inside the hook:
+Inside the hook, get the player controller and either retrieve the already-constructed second component (if it exists from a previous cast this session) or create it fresh:
 
 ```lua
 local ok, ctrl = pcall(function()
@@ -104,70 +107,87 @@ local ok, ctrl = pcall(function()
 end)
 if not ok or not ctrl or not ctrl:IsValid() then return end
 
-local ok2, personalInv = pcall(function()
-    return ctrl:GetPersonalInventory()
-end)
-if not ok2 or not personalInv or not personalInv:IsValid() then return end
+-- Construct the second PersonalInventoryComponent and attach it to the controller
+-- This should only happen once per session; store the reference in a Lua-side table keyed by ctrl
+if not SecondInventories[ctrl] then
+    local ok2, secondInv = pcall(function()
+        return StaticConstructObject(
+            StaticFindObject("/Script/Dominion.PersonalInventoryComponent"),
+            ctrl,
+            FName("SecondPersonalInventory")
+        )
+    end)
+    if not ok2 or not secondInv or not secondInv:IsValid() then return end
+
+    -- Set slot count to 40
+    secondInv:SetPropertyValue("MaxSlotCount", 40)
+
+    SecondInventories[ctrl] = secondInv
+end
+
+local secondInv = SecondInventories[ctrl]
 ```
 
-`GetPersonalInventory()` is a UFunction on `DominionPlayerController` confirmed from the GE's blueprint graph locals.
+> **Note**: The exact `StaticConstructObject` signature and whether a dynamically constructed component can participate in the bank UI needs to be validated in-game. If `StaticConstructObject` is not sufficient, an alternative is to use `RegisterCustomProperty` or find an unused component slot already on the controller.
 
-### Step 4 — Load JSON and populate the inventory
+### Step 4 — Load JSON and populate the second inventory
 
-Before opening the UI, read the JSON file and write items into the component's slots:
+Before opening the UI, read the JSON file for this character and write items into the second component's slots:
 
 ```lua
-local json = loadJSON()  -- custom helper, see Step 6
-populateInventory(personalInv, json)
+local guid = ctrl:GetCharacterGuid()  -- unique per character, confirmed in PersonalChest BP
+local json = loadJSON(guid)           -- custom helper, see Step 6
+populateInventory(secondInv, json)
 ```
 
 Populating will use `SetPropertyValue` on the inventory's items array. The exact property name needs to be confirmed by inspecting a live `PersonalInventoryComponent` instance (use `FindAllOf` or `GetPropertyValue` in-game on the component).
 
-### Step 5 — Open the bank UI
+### Step 5 — Open the UI for the second inventory
 
-Call the AccessPersonalChest GE on the player to trigger the bank UI opening. Two options:
+This step depends on whether the bank UI can be redirected to an arbitrary `PersonalInventoryComponent` instance. Two paths:
 
-**Option A — Call the GE directly**
+**Option A — Redirect GetPersonalInventory temporarily**
 ```lua
--- Apply GE_PerkV2_Construction_AccessPersonalChest_C to the player
--- This requires knowing how to apply a GE in Lua (may need to call a UFunction on AbilitySystemComponent)
+-- Pre-hook DominionPlayerController:GetPersonalInventory
+-- Swap return value to secondInv for this one call, then swap back
+-- Then trigger the AccessPersonalChest GE normally to open the UI
+```
+This is the cleanest approach if the UI purely relies on the return value of `GetPersonalInventory`.
+
+**Option B — Apply the AccessPersonalChest GE directly**
+```lua
+-- Apply GE_PerkV2_Construction_AccessPersonalChest_C to the player via AbilitySystemComponent
+-- If Option A's hook is in place, this will cause the UI to open against secondInv
 ```
 
-**Option B — Call OnGameplayEffectAdded directly on a GE instance**
-```lua
--- Find or construct a GE instance and call OnGameplayEffectAdded(instance)
--- on the controller
-```
+**Option C — Custom UI widget (fallback)**
 
-**Option C — RegisterHook on GetPersonalInventory as the open trigger**
-```lua
--- Hook DominionPlayerController:GetPersonalInventory
--- Pre-hook: populate inventory from JSON
--- Post-hook or InventoryChangedEvent: serialize to JSON
-```
+If the bank UI is hardcoded to the original component in native C++ and cannot be redirected, a custom UMG-style widget would be needed. This is the most work and should only be pursued if Options A and B are confirmed impossible.
 
-Option C is the safest since `GetPersonalInventory` is confirmed callable and is the actual gate before the UI opens. We hook it pre/post and use it as our sync point.
-
-> **To be determined**: Exact UFunction signature for opening the bank UI from Lua. If calling the GE directly is not possible, we may register a second hook on `GetPersonalInventory` as the open/close boundary.
+> **To be determined**: Whether `GetPersonalInventory`'s return value is what the UI widget actually reads, or if the UI holds a direct reference set at construction time. Runtime inspection needed.
 
 ### Step 6 — JSON helpers
 
-```lua
-local UEProjDir  = ...  -- path to Saved/ or a known writable location
-local JSON_PATH  = UEProjDir .. "/BonesToPersonalInventory.json"
+Each character gets its own JSON file named by their GUID, so multiple characters on the same machine never share or overwrite each other's second inventory.
 
-local function loadJSON()
-    -- io.open(JSON_PATH, "r"), read, parse
+```lua
+local UEProjDir = ...  -- path to Saved/ or the mod's own folder
+local function jsonPath(guid)
+    return UEProjDir .. "/PersonalInventoryMod_" .. guid .. ".json"
+end
+
+local function loadJSON(guid)
+    -- io.open(jsonPath(guid), "r"), read, parse
     -- return table of { itemPath, count } entries, or {} if no file
 end
 
-local function saveJSON(inventoryTable)
+local function saveJSON(guid, inventoryTable)
     -- serialize inventoryTable to JSON string
-    -- io.open(JSON_PATH, "w"), write
+    -- io.open(jsonPath(guid), "w"), write
 end
 ```
 
-UE4SS Lua has access to `io` so file read/write is straightforward. The JSON path can be relative to the game's `Saved/` directory or the mod's own folder.
+UE4SS Lua has access to `io` so file read/write is straightforward. The JSON file survives mod removal — if the mod is re-enabled, `loadJSON` finds the file and restores all items.
 
 For JSON encoding/decoding, either:
 - Ship a tiny pure-Lua JSON library (`json.lua`) in the mod's `Scripts/` folder
@@ -175,13 +195,15 @@ For JSON encoding/decoding, either:
 
 ### Step 7 — Serialize on change
 
-Hook the inventory change event so JSON is written whenever items are added/removed:
+After constructing the second component (Step 3), hook its inventory change event so JSON is written whenever items are added or removed. We hook the specific instance rather than all `PersonalInventoryComponent` objects to avoid interfering with the regular bank:
 
 ```lua
-NotifyOnNewObject("/Script/Dominion.PersonalInventoryComponent", function(comp)
+-- After secondInv is constructed:
+local guid = ctrl:GetCharacterGuid()
+RegisterHook(secondInv, "InventoryChangedEvent", function()
     ExecuteInGameThread(function()
-        -- Hook InventoryChangedEvent on this comp instance
-        -- On fire: serialize comp's items to JSON
+        local items = secondInv:GetPropertyValue("Items")  -- property name TBD
+        saveJSON(guid, items)
     end)
 end)
 ```
@@ -215,8 +237,9 @@ RSDragonwildsMods/
 
 ## Open Questions
 
-1. **Suppress or keep B2P default?** Does the player still want bones converted to peaches when they cast the spell, or should casting only open the bank?
-2. **Slot count**: The second inventory will have **40 slots**. `PersonalInventoryComponent.MaxSlotCount` is 20 by default and will be raised to 40 via `SetPropertyValue` at startup (same pattern as radius mods).
-3. **Multiplayer**: `GetPersonalInventory()` is called on the local player's controller. In a multiplayer session, each player's bank is separate — this should work correctly per-player as long as JSON is keyed by player GUID (available via `GetCharacterGuid()` seen in the PersonalChest BP).
-4. **Exact property name** for items array on `PersonalInventoryComponent` — needs runtime inspection or further FModel digging.
-5. **Exact UFunction name** for opening the bank UI from Lua — confirmed it goes through `GetPersonalInventory` but the UI-open call may be native C++ after that.
+1. **Suppress or keep B2P default?** Does the player still want bones converted to peaches when they cast the spell, or should casting only open the second inventory?
+2. **UI redirection** — Can the bank UI be pointed at an arbitrary `PersonalInventoryComponent` instance, or is it hardcoded to the original? (See Step 5.) This determines whether we need a custom widget.
+3. **StaticConstructObject viability** — Does UE4SS's `StaticConstructObject` produce a component that can register with the inventory UI system, or will a different construction approach be needed?
+4. **Multiplayer**: Each player's second inventory is keyed by their own character GUID, so per-player separation should work correctly in multiplayer sessions the same way the regular bank does.
+5. **Exact property name** for items array on `PersonalInventoryComponent` — needs runtime inspection or further FModel digging.
+6. **Exact event/delegate name** for inventory changes on `PersonalInventoryComponent` — needs confirmation from a live instance.

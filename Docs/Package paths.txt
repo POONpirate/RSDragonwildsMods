@@ -1,0 +1,16 @@
+RSDragonwilds/Content/Gameplay/Character/Components/BP_Components_PersonalInventory.uasset
+RSDragonwilds/Content/Gameplay/Character/Components/BP_Components_Inventory.uasset
+RSDragonwilds/Content/Gameplay/Character/Components/BP_Components_InventoryController.uasset
+
+RSDragonwilds/Content/Gameplay/BaseBuilding/Data/BuildingPieces/Furniture/Storage/BUILDPIECE_Chest_Iron.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding/Data/BuildingPieces/Furniture/Storage/BUILDPIECE_Chest_Small.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding/Data/BuildingPieces/Furniture/Storage/BUILDPIECE_Chest.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding/Data/BuildingPieces/Furniture/Storage/BUILDPIECE_PersonalChest.uasset
+
+RSDragonwilds/Content/Gameplay/BaseBuilding/Actors/Props/BP_BaseBuilding_Chest.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding/Actors/Props/BP_BaseBuilding_PersonalChest.uasset
+
+RSDragonwilds/Content/Gameplay/UtilityMagic/PerkSpells/AccessPersonalChest/USD_AccessPersonalChest.uasset
+
+RSDragonwilds/Content/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_AccessPersonalChest.uasset
+

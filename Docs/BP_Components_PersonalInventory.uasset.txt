@@ -1,0 +1,39 @@
+[
+  {
+    "Type": "BlueprintGeneratedClass",
+    "Name": "BP_Components_PersonalInventory_C",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'BlueprintGeneratedClass'",
+    "Package": "/Game/Gameplay/Character/Components/BP_Components_PersonalInventory",
+    "SuperStruct": {
+      "ObjectName": "Class'PersonalInventoryComponent'",
+      "ObjectPath": "/Script/Dominion"
+    },
+    "ClassFlags": "CLASS_Config | CLASS_CompiledFromBlueprint | CLASS_DefaultToInstanced | CLASS_HasInstancedReference",
+    "ClassWithin": {
+      "ObjectName": "Class'Object'",
+      "ObjectPath": "/Script/CoreUObject"
+    },
+    "ClassConfigName": "Engine",
+    "bCooked": true,
+    "ClassDefaultObject": {
+      "ObjectName": "BP_Components_PersonalInventory_C'Default__BP_Components_PersonalInventory_C'",
+      "ObjectPath": "/Game/Gameplay/Character/Components/BP_Components_PersonalInventory.1"
+    },
+    "EditorTags": {
+      "BlueprintType": "BPTYPE_Normal"
+    }
+  },
+  {
+    "Type": "BP_Components_PersonalInventory_C",
+    "Name": "Default__BP_Components_PersonalInventory_C",
+    "Flags": "RF_Public | RF_Transactional | RF_ClassDefaultObject | RF_ArchetypeObject | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "BlueprintGeneratedClass'/Game/Gameplay/Character/Components/BP_Components_PersonalInventory.BP_Components_PersonalInventory_C'",
+    "Package": "/Game/Gameplay/Character/Components/BP_Components_PersonalInventory",
+    "Properties": {
+      "MaxSlotCount": 20,
+      "bSupportsSortAndFillStacks": true,
+      "bShouldGenerateTelemetryEvents": true
+    }
+  }
+]

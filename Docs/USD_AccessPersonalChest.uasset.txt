@@ -1,0 +1,119 @@
+[
+  {
+    "Type": "SpellModule_Cast",
+    "Name": "SpellModule_Cast_0",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'SpellModule_Cast'",
+    "Outer": {
+      "ObjectName": "UtilitySpellData'USD_AccessPersonalChest'",
+      "ObjectPath": "/Game/Gameplay/UtilityMagic/PerkSpells/AccessPersonalChest/USD_AccessPersonalChest.4"
+    },
+    "Properties": {
+      "ModuleName": "Cast",
+      "Triggers": {
+        "PlayMontageRef": {
+          "ModuleName": "PlayMontage"
+        },
+        "AnimNotifyClass": {
+          "ObjectName": "BlueprintGeneratedClass'AnimNotify_AttackDamagePoint_C'",
+          "ObjectPath": "/Game/Gameplay/Character/Player/AnimNotifies/AnimNotify_AttackDamagePoint.1"
+        }
+      }
+    }
+  },
+  {
+    "Type": "SpellModule_CostItems",
+    "Name": "SpellModule_CostItems_0",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'SpellModule_CostItems'",
+    "Outer": {
+      "ObjectName": "UtilitySpellData'USD_AccessPersonalChest'",
+      "ObjectPath": "/Game/Gameplay/UtilityMagic/PerkSpells/AccessPersonalChest/USD_AccessPersonalChest.4"
+    },
+    "Properties": {
+      "ItemsCostInfo": [
+        {
+          "ItemData": {
+            "ObjectName": "ItemData'ITEM_Rune_Law'",
+            "ObjectPath": "/Game/Gameplay/Items/Resources/Magic/ITEM_Rune_Law.0"
+          },
+          "Count": 20
+        },
+        {
+          "ItemData": {
+            "ObjectName": "ItemData'ITEM_Rune_Astral'",
+            "ObjectPath": "/Game/Gameplay/Items/Resources/Magic/ITEM_Rune_Astral.0"
+          },
+          "Count": 15
+        }
+      ],
+      "bUseMagicAmmo": false,
+      "ModuleName": "CostItems",
+      "Triggers": {
+        "PlayMontageRef": {
+          "ModuleName": "PlayMontage"
+        },
+        "AnimNotifyClass": {
+          "ObjectName": "BlueprintGeneratedClass'AnimNotify_AttackDamagePoint_C'",
+          "ObjectPath": "/Game/Gameplay/Character/Player/AnimNotifies/AnimNotify_AttackDamagePoint.1"
+        }
+      }
+    }
+  },
+  {
+    "Type": "SpellModule_GameplayEffect",
+    "Name": "SpellModule_GameplayEffect_0",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'SpellModule_GameplayEffect'",
+    "Outer": {
+      "ObjectName": "UtilitySpellData'USD_AccessPersonalChest'",
+      "ObjectPath": "/Game/Gameplay/UtilityMagic/PerkSpells/AccessPersonalChest/USD_AccessPersonalChest.4"
+    },
+    "Properties": {
+      "GameplayEffect": {
+        "ObjectName": "BlueprintGeneratedClass'GE_PerkV2_Construction_AccessPersonalChest_C'",
+        "ObjectPath": "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_AccessPersonalChest.0"
+      },
+      "GameplayEffectSpellTarget": "EGameplayEffectSpellTarget::SpellOwner",
+      "bSkipCanBeDamagedCheck": true,
+      "ModuleName": "GameplayEffect",
+      "Triggers": {
+        "bHasStateTrigger": true,
+        "StateTrigger": "ESpellStateTrigger::FinishedCasting"
+      }
+    }
+  },
+  {
+    "Type": "SpellModule_PlayMontage",
+    "Name": "SpellModule_PlayMontage_0",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'SpellModule_PlayMontage'",
+    "Outer": {
+      "ObjectName": "UtilitySpellData'USD_AccessPersonalChest'",
+      "ObjectPath": "/Game/Gameplay/UtilityMagic/PerkSpells/AccessPersonalChest/USD_AccessPersonalChest.4"
+    },
+    "Properties": {
+      "Montage": {
+        "ObjectName": "AnimMontage'AM_PlayerM_Sorcery_Spellcast_BankPortal'",
+        "ObjectPath": "/Game/Art/Animation/PlayerM/Sorcery/AM_PlayerM_Sorcery_Spellcast_BankPortal.0"
+      },
+      "bShouldRotateToCameraForward": false,
+      "ModuleName": "PlayMontage"
+    }
+  },
+  {
+    "Type": "UtilitySpellData",
+    "Name": "USD_AccessPersonalChest",
+    "Flags": "RF_Public | RF_Standalone | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'UtilitySpellData'",
+    "Package": "/Game/Gameplay/UtilityMagic/PerkSpells/AccessPersonalChest/USD_AccessPersonalChest",
+    "Properties": {
+      "SpellDisplayName": {
+        "TableId": "/Game/Gameplay/Character/Player/PerksV2/ST_Skills_Perks.ST_Skills_Perks",
+        "Key": "Construction.PersonalChest.Name",
+        "SourceString": "Personal Chest",
+        "LocalizedString": "Personal Chest"
+      }
+    }
+  }
+]

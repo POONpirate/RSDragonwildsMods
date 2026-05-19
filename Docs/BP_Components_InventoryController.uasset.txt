@@ -1,0 +1,50 @@
+[
+  {
+    "Type": "BlueprintGeneratedClass",
+    "Name": "BP_Components_InventoryController_C",
+    "Flags": "RF_Public | RF_Transactional | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "UScriptClass'BlueprintGeneratedClass'",
+    "Package": "/Game/Gameplay/Character/Components/BP_Components_InventoryController",
+    "SuperStruct": {
+      "ObjectName": "Class'InventoryController'",
+      "ObjectPath": "/Script/Dominion"
+    },
+    "ClassFlags": "CLASS_Config | CLASS_CompiledFromBlueprint | CLASS_DefaultToInstanced | CLASS_HasInstancedReference",
+    "ClassWithin": {
+      "ObjectName": "Class'Object'",
+      "ObjectPath": "/Script/CoreUObject"
+    },
+    "ClassConfigName": "Engine",
+    "bCooked": true,
+    "ClassDefaultObject": {
+      "ObjectName": "BP_Components_InventoryController_C'Default__BP_Components_InventoryController_C'",
+      "ObjectPath": "/Game/Gameplay/Character/Components/BP_Components_InventoryController.1"
+    },
+    "EditorTags": {
+      "BlueprintType": "BPTYPE_Normal"
+    }
+  },
+  {
+    "Type": "BP_Components_InventoryController_C",
+    "Name": "Default__BP_Components_InventoryController_C",
+    "Flags": "RF_Public | RF_ClassDefaultObject | RF_ArchetypeObject | RF_WasLoaded | RF_LoadCompleted",
+    "Class": "BlueprintGeneratedClass'/Game/Gameplay/Character/Components/BP_Components_InventoryController.BP_Components_InventoryController_C'",
+    "Package": "/Game/Gameplay/Character/Components/BP_Components_InventoryController",
+    "Properties": {
+      "ConsumableTypesToDesaturateWhenUnusable": [
+        {
+          "ObjectName": "Class'ConsumableRecipeUnlocker'",
+          "ObjectPath": "/Script/Dominion"
+        },
+        {
+          "ObjectName": "BlueprintGeneratedClass'BP_Consumables_BuildingUnlocker_C'",
+          "ObjectPath": "/Game/Gameplay/Items/Consumables/BP_Consumables_BuildingUnlocker.0"
+        },
+        {
+          "ObjectName": "BlueprintGeneratedClass'BP_Consumables_RecipeUnlocker2_C'",
+          "ObjectPath": "/Game/Gameplay/Items/Consumables/BP_Consumables_RecipeUnlocker2.0"
+        }
+      ]
+    }
+  }
+]

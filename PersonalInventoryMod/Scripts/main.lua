@@ -372,6 +372,45 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
         log("Player controller ready — registering hooks...")
 
+        -- Post-hook on our second inventory's OpenPersonalInventory.
+        -- OpenPersonalInventory likely rewrites JsonInventory from ItemSlots during its
+        -- execution, trimming MaxSlotIndex to the highest occupied slot.  We intercept
+        -- immediately after and patch it back to 39, then broadcast so the open UI
+        -- refreshes to show all 40 slots.
+        local ok_opi = pcall(function()
+            RegisterHook("/Script/Dominion.PersonalInventoryComponent:OpenPersonalInventory",
+                function(self, p1, char_obj) end,
+                function(self, p1, char_obj)
+                    local ok_get, comp = pcall(function() return self:get() end)
+                    if not ok_get or not comp or not comp:IsValid() then return end
+                    local ok_nm, nm = pcall(function() return comp:GetName() end)
+                    if not ok_nm or not nm or not nm:find("SecondPersonalInventory") then return end
+
+                    ExecuteInGameThread(function()
+                        -- Read JsonInventory after OpenPersonalInventory ran.
+                        local ok_j, j_str = pcall(function()
+                            return comp:GetPropertyValue("JsonInventory"):ToString()
+                        end)
+                        local preview = (ok_j and j_str) and j_str:sub(1, 200) or "(unavailable)"
+                        log("JsonInventory after open: " .. preview)
+
+                        -- Patch MaxSlotIndex → 39 (if engine overwrote it) and broadcast
+                        -- so the live UI refreshes to 40 slots.
+                        if ok_j and j_str and j_str ~= "" then
+                            local patched = j_str:gsub('"MaxSlotIndex":%d+', '"MaxSlotIndex":' .. (SECOND_INV_SLOTS - 1))
+                            populate_inventory(comp, patched)
+                            log("Post-open: patched MaxSlotIndex→39 and broadcast.")
+                        else
+                            populate_inventory(comp, SLOT_LAYOUT_JSON)
+                            log("Post-open: broadcast SLOT_LAYOUT_JSON (no existing JSON).")
+                        end
+                    end)
+                end
+            )
+        end)
+        if ok_opi then log("OpenPersonalInventory post-hook registered.")
+        else log_err("Could not hook OpenPersonalInventory.") end
+
         local ok_oa = pcall(function()
             RegisterHook("/Script/Dominion.OculusComponent:ActivateOculus",
                 function(self) end,
@@ -480,13 +519,30 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                             LoadedFromDisk[guid] = true
                             log("Restored from disk save.")
                         else
-                            -- ItemSlots is already pre-allocated from construction seed.
-                            -- Just refresh JsonInventory string so UI stays at 40 slots.
-                            local ok_layout = pcall(function()
-                                second_inv:SetPropertyValue("JsonInventory", SLOT_LAYOUT_JSON)
+                            -- Broadcast with SLOT_LAYOUT_JSON (MaxSlotIndex:39, no item entries)
+                            -- on EVERY cast.  Goal: engine's OnInventoryLoadedFromSave handler
+                            -- should call ItemSlots.SetNum(40) non-destructively, expanding the
+                            -- array back to 40 slots after the game trimmed it on item placement.
+                            -- If items disappear after this, the handler clears on broadcast and
+                            -- we need a different approach.
+                            populate_inventory(second_inv, SLOT_LAYOUT_JSON)
+                            log("Broadcast SLOT_LAYOUT_JSON — testing non-destructive SetNum(40).")
+
+                            -- Diagnostic: probe TArray indexing (0-based vs 1-based) and slot count.
+                            local ok_s, sv = pcall(function()
+                                return second_inv:GetPropertyValue("ItemSlots")
                             end)
-                            if ok_layout then
-                                log("Refreshed layout JSON (40 slots, ItemSlots untouched).")
+                            if ok_s and sv ~= nil then
+                                local ok0,  s0  = pcall(function() return sv[0]  end)
+                                local ok1,  s1  = pcall(function() return sv[1]  end)
+                                local ok39, s39 = pcall(function() return sv[39] end)
+                                local ok40, s40 = pcall(function() return sv[40] end)
+                                log(string.format(
+                                    "ItemSlots idx: [0]=%s [1]=%s [39]=%s [40]=%s",
+                                    ok0  and type(s0)  or "err",
+                                    ok1  and type(s1)  or "err",
+                                    ok39 and type(s39) or "err",
+                                    ok40 and type(s40) or "err"))
                             end
                         end
 

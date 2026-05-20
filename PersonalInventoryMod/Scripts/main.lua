@@ -18,7 +18,6 @@ local SECOND_INV_SLOTS = 40
 
 local SPELL_HOOK = "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded"
 
--- Game-save hook candidates. Whichever the game calls will trigger save_all_inventories().
 local GAME_SAVE_HOOKS = {
     "/Script/Dominion.DominionPlayerController:ServerSaveCharacter",
     "/Script/Dominion.DominionPlayerController:SaveCharacter",
@@ -29,20 +28,8 @@ local GAME_SAVE_HOOKS = {
     "/Script/Engine.GameplayStatics:SaveGameToSlot",
 }
 
--- Candidate paths for the close function. "InventoryComponent" is the confirmed
--- base class (141 instances found); "PersonalInventoryComponent" is our specific
--- class. We try both — whichever is hookable will fire.
-local CLOSE_HOOK_PATHS = {
-    "/Script/Dominion.PersonalInventoryComponent:ClosePersonalInventory",
-    "/Script/Dominion.InventoryComponent:ClosePersonalInventory",
-}
-
--- Observed JsonInventory format (from InventoryComponent [4],[5] in diagnostic):
--- { "Version": 67, "0": {"GUID":"...","ItemData":"...","Count":N}, ...,
---   "MaxSlotIndex": N, "AllowAdds": false }
---
--- Empty seed passed to OpenPersonalInventory so the engine creates the slot array
--- and ctrl+click works on the first open. MaxSlotIndex:-1 = no items, just structure.
+-- Confirmed empty inventory format (observed from real InventoryComponent instances).
+-- Seeded before first open so OpenPersonalInventory initializes the slot array.
 local EMPTY_INV_JSON = '{"Version":67,"MaxSlotIndex":-1,"AllowAdds":false}'
 
 local SAVE_DIR = nil
@@ -50,10 +37,13 @@ local SAVE_DIR = nil
 -- -----------------------------------------------------------------------------
 -- Runtime state
 -- -----------------------------------------------------------------------------
+-- All tables are keyed by GUID (stable string), NOT by ctrl (Lua proxy object).
+-- FindAllOf returns a new Lua proxy object each call even for the same underlying
+-- UObject, so using ctrl as a table key always misses on subsequent casts.
 
-local SecondInventories  = {}  -- ctrl → PersonalInventoryComponent
-local ControllerGuids    = {}  -- ctrl → guid string
-local CachedInventoryJson = {} -- ctrl → json string captured at close time
+local SecondInventories  = {}  -- guid → PersonalInventoryComponent
+local ControllersByGuid  = {}  -- guid → ctrl  (kept for open/save calls)
+local CachedInventoryJson = {} -- guid → json string (captured from component between casts)
 
 -- -----------------------------------------------------------------------------
 -- Logging helpers
@@ -90,21 +80,16 @@ local function load_inventory_data(guid)
     local path = json_path(guid)
     local file = io.open(path, "r")
     if not file then
-        log("No save file found for GUID " .. guid .. ", starting empty.")
+        log("No save file found for GUID " .. guid .. ".")
         return nil
     end
     local content = file:read("*a")
     file:close()
-
     if content == "" then return nil end
-
-    -- Raw engine JsonInventory string — pass straight back to populate_inventory.
     log("Loaded saved inventory for GUID " .. guid)
     return content
 end
 
--- fallback_json: used when JsonInventory on the component is empty (e.g. between
--- close and the next game save). This is the last value captured at close time.
 local function save_inventory_data(guid, inv_comp, fallback_json)
     if not inv_comp or not inv_comp:IsValid() then return end
 
@@ -122,14 +107,14 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
     if ok_json and json_str and json_str ~= "" and json_str ~= EMPTY_INV_JSON then
         file:write(json_str)
         file:close()
-        log("Saved inventory (live JsonInventory) for GUID " .. guid)
+        log("Saved inventory (live) for GUID " .. guid)
         return
     end
 
     if fallback_json and fallback_json ~= "" and fallback_json ~= EMPTY_INV_JSON then
         file:write(fallback_json)
         file:close()
-        log("Saved inventory (cached close-time JsonInventory) for GUID " .. guid)
+        log("Saved inventory (cached) for GUID " .. guid)
         return
     end
 
@@ -137,18 +122,16 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
     log("Inventory is empty — nothing written for GUID " .. guid)
 end
 
--- Saves all active second inventories. Called from game-save hooks.
 local function save_all_inventories()
     local count = 0
-    for ctrl, inv in pairs(SecondInventories) do
-        local guid = ControllerGuids[ctrl]
-        if guid and ctrl:IsValid() and inv:IsValid() then
-            save_inventory_data(guid, inv, CachedInventoryJson[ctrl])
+    for guid, inv in pairs(SecondInventories) do
+        if inv:IsValid() then
+            save_inventory_data(guid, inv, CachedInventoryJson[guid])
             count = count + 1
         end
     end
     if count > 0 then
-        log("Game save detected — wrote " .. count .. " second inventor" .. (count == 1 and "y." or "ies."))
+        log("Game save — wrote " .. count .. " second inventor" .. (count == 1 and "y." or "ies."))
     end
 end
 
@@ -158,12 +141,11 @@ end
 
 local function populate_inventory(inv_comp, data)
     if not data or data == "" then return end
-
     local ok, err = pcall(function()
         inv_comp:SetPropertyValue("JsonInventory", data)
     end)
     if ok then
-        log("Populated inventory from saved data.")
+        log("Set JsonInventory on component.")
         pcall(function() inv_comp.OnInventoryLoadedFromSave:Broadcast() end)
     else
         log_err("Failed to set JsonInventory: " .. tostring(err))
@@ -174,11 +156,30 @@ end
 -- Second inventory component construction
 -- -----------------------------------------------------------------------------
 
-local function get_or_create_second_inventory(ctrl)
-    if SecondInventories[ctrl] and SecondInventories[ctrl]:IsValid() then
-        return SecondInventories[ctrl]
+local function get_or_create_second_inventory(guid, ctrl)
+    -- Check existing Lua reference first.
+    if SecondInventories[guid] and SecondInventories[guid]:IsValid() then
+        log("Reusing existing second inventory component.")
+        return SecondInventories[guid]
     end
 
+    -- Lua reference may be stale even if the UObject is still alive (GC hasn't
+    -- collected it because ctrl is still its outer). Search by component name.
+    local ok_fa, all_pics = pcall(function() return FindAllOf("PersonalInventoryComponent") end)
+    if ok_fa and all_pics then
+        for _, pic in ipairs(all_pics) do
+            if pic:IsValid() then
+                local ok_nm, nm = pcall(function() return pic:GetName() end)
+                if ok_nm and nm and nm:find("SecondPersonalInventory") then
+                    log("Re-found SecondPersonalInventory by name — storing reference.")
+                    SecondInventories[guid] = pic
+                    return pic
+                end
+            end
+        end
+    end
+
+    -- Construct a new component.
     local ok, second_inv = pcall(function()
         return StaticConstructObject(
             StaticFindObject("/Script/Dominion.PersonalInventoryComponent"),
@@ -202,10 +203,10 @@ local function get_or_create_second_inventory(ctrl)
     end
 
     -- NOTE: RegisterComponent(), InitializeComponent(), BeginPlay() all fail with
-    -- "UObject instance is nullptr" in this UE4SS build (not callable as UFunctions).
-    -- ctrl+click initialization is handled by seeding EMPTY_INV_JSON before first open.
+    -- "UObject instance is nullptr" in this UE4SS build. ctrl+click is handled
+    -- via EMPTY_INV_JSON seed before first open.
 
-    SecondInventories[ctrl] = second_inv
+    SecondInventories[guid] = second_inv
     return second_inv
 end
 
@@ -214,8 +215,6 @@ end
 -- -----------------------------------------------------------------------------
 
 local function open_second_inventory_ui(ctrl, second_inv, char_obj)
-    -- p1=34 matches real chest calls (param-spy confirmed). p1=0 opens the UI
-    -- but ctrl+click reports "cannot be stored".
     local ok, err = pcall(function()
         second_inv:OpenPersonalInventory(34, char_obj)
     end)
@@ -230,27 +229,6 @@ local function open_second_inventory_ui(ctrl, second_inv, char_obj)
             log("OpenPersonalInventory fallback (p1=ctrl) succeeded.")
         else
             log_err("OpenPersonalInventory fallback also failed: " .. tostring(err2))
-        end
-    end
-end
-
--- -----------------------------------------------------------------------------
--- Close-time JSON capture
--- -----------------------------------------------------------------------------
--- Called from ClosePersonalInventory hooks (post-hook). Reads JsonInventory from
--- every active second inventory and caches it. This is the only reliable point
--- where the engine has serialized in-memory item state back to JsonInventory.
-
-local function capture_inventory_on_close()
-    for ctrl, inv in pairs(SecondInventories) do
-        if inv:IsValid() then
-            local ok_j, j = pcall(function()
-                return inv:GetPropertyValue("JsonInventory"):ToString()
-            end)
-            if ok_j and j and j ~= "" and j ~= EMPTY_INV_JSON then
-                CachedInventoryJson[ctrl] = j
-                log("Captured JsonInventory at close (len=" .. #j .. ").")
-            end
         end
     end
 end
@@ -286,23 +264,6 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
         log("Player controller ready — registering hooks...")
 
-        -- Close-inventory hooks: capture JsonInventory at close time so it can be
-        -- restored before the next OpenPersonalInventory (which reloads from JsonInventory
-        -- and would otherwise wipe in-session items since our component is never
-        -- serialized by the game's own save flow).
-        for _, close_path in ipairs(CLOSE_HOOK_PATHS) do
-            local ok_c = pcall(function()
-                RegisterHook(close_path,
-                    function() end,
-                    function() ExecuteInGameThread(capture_inventory_on_close) end
-                )
-            end)
-            if ok_c then
-                log("Close hook registered: " .. close_path)
-            end
-        end
-
-        -- Suppress the Eye of Oculus build menu via DeactivateOculus in the post-hook.
         local ok_oa = pcall(function()
             RegisterHook("/Script/Dominion.OculusComponent:ActivateOculus",
                 function(self) end,
@@ -318,11 +279,8 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                 end
             )
         end)
-        if ok_oa then
-            log("OculusComponent:ActivateOculus hook registered.")
-        else
-            log_err("Could not hook ActivateOculus.")
-        end
+        if ok_oa then log("OculusComponent:ActivateOculus hook registered.")
+        else log_err("Could not hook ActivateOculus.") end
 
         local reg_ok, reg_err = pcall(function()
             RegisterHook(SPELL_HOOK,
@@ -353,7 +311,7 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                             return
                         end
 
-                        -- Resolve and cache GUID.
+                        -- Resolve GUID.
                         local ok_guid, guid_struct = pcall(function() return ctrl:GetCharacterGuid() end)
                         if not ok_guid or not guid_struct then
                             log_err("GetCharacterGuid failed: " .. tostring(guid_struct))
@@ -377,7 +335,7 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                             return
                         end
                         log("Controller found, GUID=" .. guid)
-                        ControllerGuids[ctrl] = guid
+                        ControllersByGuid[guid] = ctrl
 
                         local char_obj = nil
                         local ok_ch, chars = pcall(function() return FindAllOf("DominionPlayerCharacter") end)
@@ -390,31 +348,49 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                             log_err("Could not find DominionPlayerCharacter — UI may not open.")
                         end
 
-                        local second_inv = get_or_create_second_inventory(ctrl)
+                        local second_inv = get_or_create_second_inventory(guid, ctrl)
                         if not second_inv then return end
 
-                        -- Determine what JsonInventory to set before opening:
-                        -- 1. Cached close-time JSON (items from this session)
-                        -- 2. Saved JSON from disk (items from a previous session)
-                        -- 3. EMPTY_INV_JSON seed (first ever open — initializes slot array
-                        --    so ctrl+click works immediately)
-                        local restore_json = CachedInventoryJson[ctrl]
+                        -- Decide what JSON to present to OpenPersonalInventory.
+                        -- OpenPersonalInventory reloads from JsonInventory on every call,
+                        -- wiping anything placed since the last open. We must set
+                        -- JsonInventory to the correct state immediately before calling it.
+                        --
+                        -- Priority:
+                        --   1. Current live JsonInventory on the component — if it's already
+                        --      non-empty (items placed this session and JsonInventory updated
+                        --      by the engine), just re-set it so OpenPersonalInventory sees it.
+                        --   2. CachedInventoryJson — captured at close time if close hook works.
+                        --   3. Disk save — items from a previous game session.
+                        --   4. EMPTY_INV_JSON seed — very first open ever.
 
-                        if not restore_json then
-                            restore_json = load_inventory_data(guid)
-                        end
+                        local ok_live, live_json = pcall(function()
+                            return second_inv:GetPropertyValue("JsonInventory"):ToString()
+                        end)
+                        local has_live = ok_live and live_json and
+                                         live_json ~= "" and live_json ~= EMPTY_INV_JSON
 
-                        if restore_json then
-                            populate_inventory(second_inv, restore_json)
-                            log("Restored " .. (CachedInventoryJson[ctrl] and "session" or "saved") .. " inventory data.")
+                        if has_live then
+                            -- Re-set so OpenPersonalInventory definitely sees it.
+                            pcall(function() second_inv:SetPropertyValue("JsonInventory", live_json) end)
+                            log("Re-applied live JsonInventory (len=" .. #live_json .. ").")
+                            CachedInventoryJson[guid] = live_json  -- keep cache in sync
+
+                        elseif CachedInventoryJson[guid] then
+                            populate_inventory(second_inv, CachedInventoryJson[guid])
+                            log("Restored from session cache (len=" .. #CachedInventoryJson[guid] .. ").")
+
                         else
-                            -- First ever open: seed with known-good empty format so
-                            -- OpenPersonalInventory initializes the slot array properly.
-                            local ok_seed = pcall(function()
-                                second_inv:SetPropertyValue("JsonInventory", EMPTY_INV_JSON)
-                            end)
-                            if ok_seed then
-                                log("Seeded empty inventory JSON (first open, format confirmed safe).")
+                            local saved = load_inventory_data(guid)
+                            if saved then
+                                populate_inventory(second_inv, saved)
+                                log("Restored from disk.")
+                            else
+                                -- First ever open.
+                                local ok_seed = pcall(function()
+                                    second_inv:SetPropertyValue("JsonInventory", EMPTY_INV_JSON)
+                                end)
+                                if ok_seed then log("Seeded empty inventory (first open).") end
                             end
                         end
 

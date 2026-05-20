@@ -28,9 +28,29 @@ local GAME_SAVE_HOOKS = {
     "/Script/Engine.GameplayStatics:SaveGameToSlot",
 }
 
--- Confirmed empty inventory format (observed from real InventoryComponent instances).
--- Seeded before first open so OpenPersonalInventory initializes the slot array.
-local EMPTY_INV_JSON = '{"Version":67,"MaxSlotIndex":-1,"AllowAdds":false}'
+-- Confirmed format (observed from real InventoryComponent instances).
+-- MaxSlotIndex:39 = "slots 0-39 exist" → UI renders 40 slots.
+-- MaxSlotIndex:-1 only rendered 1 slot (just enough for the first item in ItemSlots).
+-- Item content comes from ItemSlots (in-memory), NOT from this string — so setting
+-- this before every OpenPersonalInventory gives us 40 slots without wiping items.
+local SLOT_LAYOUT_JSON = '{"Version":67,"MaxSlotIndex":' .. (SECOND_INV_SLOTS - 1) .. ',"AllowAdds":false}'
+
+-- 40-slot empty inventory JSON.  Used ONCE at component construction: setting this as
+-- JsonInventory then firing OnInventoryLoadedFromSave:Broadcast() causes the engine to
+-- parse the 40 explicit slot entries and pre-populate ItemSlots with 40 empty FItemSlot
+-- structs.  Without this, ItemSlots starts at size 0 and only grows one entry per manual
+-- drag, making all other slots unusable.
+-- Excluded from save checks just like SLOT_LAYOUT_JSON.
+local EMPTY_GUID = "00000000000000000000000000000000"
+local function _build_empty_inv_json(n)
+    local t = { '{"Version":67' }
+    for i = 0, n - 1 do
+        t[#t + 1] = string.format(',"%d":{"GUID":"%s","ItemData":"","Count":0}', i, EMPTY_GUID)
+    end
+    t[#t + 1] = string.format(',"MaxSlotIndex":%d,"AllowAdds":false}', n - 1)
+    return table.concat(t)
+end
+local EMPTY_INV_JSON = _build_empty_inv_json(SECOND_INV_SLOTS)
 
 local SAVE_DIR = nil
 
@@ -44,6 +64,7 @@ local SAVE_DIR = nil
 local SecondInventories  = {}  -- guid → PersonalInventoryComponent
 local ControllersByGuid  = {}  -- guid → ctrl  (kept for open/save calls)
 local CachedInventoryJson = {} -- guid → json string (captured from component between casts)
+local LoadedFromDisk     = {}  -- guid → true once disk save has been restored this session
 
 -- -----------------------------------------------------------------------------
 -- Logging helpers
@@ -104,14 +125,14 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
         return inv_comp:GetPropertyValue("JsonInventory"):ToString()
     end)
 
-    if ok_json and json_str and json_str ~= "" and json_str ~= EMPTY_INV_JSON then
+    if ok_json and json_str and json_str ~= "" and json_str ~= SLOT_LAYOUT_JSON and json_str ~= EMPTY_INV_JSON then
         file:write(json_str)
         file:close()
         log("Saved inventory (live) for GUID " .. guid)
         return
     end
 
-    if fallback_json and fallback_json ~= "" and fallback_json ~= EMPTY_INV_JSON then
+    if fallback_json and fallback_json ~= "" and fallback_json ~= SLOT_LAYOUT_JSON and fallback_json ~= EMPTY_INV_JSON then
         file:write(fallback_json)
         file:close()
         log("Saved inventory (cached) for GUID " .. guid)
@@ -202,9 +223,96 @@ local function get_or_create_second_inventory(guid, ctrl)
         log("Second inventory constructed with " .. SECOND_INV_SLOTS .. " slots.")
     end
 
-    -- NOTE: RegisterComponent(), InitializeComponent(), BeginPlay() all fail with
-    -- "UObject instance is nullptr" in this UE4SS build. ctrl+click is handled
-    -- via EMPTY_INV_JSON seed before first open.
+    -- Pre-allocate the ItemSlots TArray to SECOND_INV_SLOTS entries.
+    -- Without this, the array starts at size 0. The first drag creates entry 0;
+    -- all other visual slots are ghost slots that silently reject items.
+    -- RegisterComponent/InitializeComponent/BeginPlay all fail as UFunctions in
+    -- this UE4SS build ("UObject instance is nullptr"), so we try several paths.
+
+    -- Attempt 1: ReceiveBeginPlay — the BlueprintImplementableEvent version of
+    -- BeginPlay IS a UFUNCTION. If PersonalInventoryComponent has BP logic in its
+    -- BeginPlay that calls ItemSlots.SetNum(MaxSlotCount), this will trigger it.
+    local ok_rbp = pcall(function() second_inv:ReceiveBeginPlay() end)
+    if ok_rbp then
+        log("ReceiveBeginPlay() succeeded — ItemSlots should be pre-allocated.")
+    else
+        -- Attempt 2: SetPropertyValue("ItemSlots", ...) with an array of 40 empty
+        -- tables. UE4SS may default-initialize each FItemSlot struct from the empty
+        -- table, giving us 40 pre-allocated (empty) slot entries.
+        local ok_pre = pcall(function()
+            local slots = {}
+            for i = 1, SECOND_INV_SLOTS do slots[i] = {} end
+            second_inv:SetPropertyValue("ItemSlots", slots)
+        end)
+        if ok_pre then
+            log("ItemSlots pre-allocated via SetPropertyValue (40 empty entries).")
+        else
+            -- Attempt 3: game-specific named functions.
+            local named_fns = {
+                { "InitInventory",       function() second_inv:InitInventory(SECOND_INV_SLOTS) end },
+                { "InitializeInventory", function() second_inv:InitializeInventory(SECOND_INV_SLOTS) end },
+                { "SetNumSlots",         function() second_inv:SetNumSlots(SECOND_INV_SLOTS) end },
+                { "ResizeInventory",     function() second_inv:ResizeInventory(SECOND_INV_SLOTS) end },
+                { "EnsureSlotCount",     function() second_inv:EnsureSlotCount(SECOND_INV_SLOTS) end },
+                { "AddSlots",            function() second_inv:AddSlots(SECOND_INV_SLOTS) end },
+                { "SetInventorySize",    function() second_inv:SetInventorySize(SECOND_INV_SLOTS) end },
+            }
+            local any_ok = false
+            for _, entry in ipairs(named_fns) do
+                local ok_fn = pcall(entry[2])
+                if ok_fn then
+                    log("Slot pre-alloc via " .. entry[1] .. "() succeeded!")
+                    any_ok = true
+                    break
+                end
+            end
+            if not any_ok then
+                log_err("All slot pre-alloc attempts failed. Only 1 slot will be usable until this is resolved.")
+            end
+        end
+    end
+
+    -- Diagnostic: read ItemSlots back to see what state the TArray is in.
+    -- GetPropertyValue returns a TArray as userdata (not a Lua table), so #slots_val
+    -- won't work — try the TArray:Num() method instead.
+    local ok_diag, slots_val = pcall(function()
+        return second_inv:GetPropertyValue("ItemSlots")
+    end)
+    if ok_diag and slots_val ~= nil then
+        local slots_type = type(slots_val)
+        local slots_count
+        if slots_type == "table" then
+            slots_count = tostring(#slots_val)
+        else
+            local ok_num, num = pcall(function() return slots_val:Num() end)
+            slots_count = ok_num and tostring(num) or "? (Num() unavailable)"
+        end
+        log("ItemSlots after pre-alloc: type=" .. slots_type .. " count=" .. slots_count)
+    else
+        log("ItemSlots diagnostic: read failed or returned nil.")
+    end
+
+    -- Seed with empty 40-slot JSON and broadcast OnInventoryLoadedFromSave so the engine
+    -- parses the 40 slot entries and pre-populates ItemSlots with 40 empty FItemSlot structs.
+    -- This runs only here (fresh construction), never on reuse, so live items are never wiped.
+    populate_inventory(second_inv, EMPTY_INV_JSON)
+    log("Seeded empty 40-slot JSON — engine should pre-allocate ItemSlots via Broadcast().")
+
+    -- Confirm ItemSlots count after seeding.
+    local ok_diag2, slots_val2 = pcall(function()
+        return second_inv:GetPropertyValue("ItemSlots")
+    end)
+    if ok_diag2 and slots_val2 ~= nil then
+        local slots_type2 = type(slots_val2)
+        local slots_count2
+        if slots_type2 == "table" then
+            slots_count2 = tostring(#slots_val2)
+        else
+            local ok_n2, n2 = pcall(function() return slots_val2:Num() end)
+            slots_count2 = ok_n2 and tostring(n2) or "? (Num() unavailable)"
+        end
+        log("ItemSlots after seed: type=" .. slots_type2 .. " count=" .. slots_count2)
+    end
 
     SecondInventories[guid] = second_inv
     return second_inv
@@ -351,46 +459,34 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                         local second_inv = get_or_create_second_inventory(guid, ctrl)
                         if not second_inv then return end
 
-                        -- Decide what JSON to present to OpenPersonalInventory.
-                        -- OpenPersonalInventory reloads from JsonInventory on every call,
-                        -- wiping anything placed since the last open. We must set
-                        -- JsonInventory to the correct state immediately before calling it.
+                        -- JsonInventory controls grid layout (how many slots the UI renders).
+                        -- ItemSlots holds actual item data and persists in-memory on the
+                        -- component between casts. The engine does NOT update JsonInventory
+                        -- when items are dragged in — only during game serialization/save.
                         --
-                        -- Priority:
-                        --   1. Current live JsonInventory on the component — if it's already
-                        --      non-empty (items placed this session and JsonInventory updated
-                        --      by the engine), just re-set it so OpenPersonalInventory sees it.
-                        --   2. CachedInventoryJson — captured at close time if close hook works.
-                        --   3. Disk save — items from a previous game session.
-                        --   4. EMPTY_INV_JSON seed — very first open ever.
+                        -- On the very first open after loading (disk save exists), we restore
+                        -- by calling populate_inventory, which sets JsonInventory and fires
+                        -- OnInventoryLoadedFromSave:Broadcast() so the engine rebuilds ItemSlots.
+                        -- LoadedFromDisk prevents re-loading on subsequent casts, which would
+                        -- overwrite any items moved since the last restore.
+                        --
+                        -- When there is no disk save (or already restored), we only update
+                        -- JsonInventory via SetPropertyValue (no broadcast) to keep the 40-slot
+                        -- grid visible without touching the live ItemSlots array.
 
-                        local ok_live, live_json = pcall(function()
-                            return second_inv:GetPropertyValue("JsonInventory"):ToString()
-                        end)
-                        local has_live = ok_live and live_json and
-                                         live_json ~= "" and live_json ~= EMPTY_INV_JSON
-
-                        if has_live then
-                            -- Re-set so OpenPersonalInventory definitely sees it.
-                            pcall(function() second_inv:SetPropertyValue("JsonInventory", live_json) end)
-                            log("Re-applied live JsonInventory (len=" .. #live_json .. ").")
-                            CachedInventoryJson[guid] = live_json  -- keep cache in sync
-
-                        elseif CachedInventoryJson[guid] then
-                            populate_inventory(second_inv, CachedInventoryJson[guid])
-                            log("Restored from session cache (len=" .. #CachedInventoryJson[guid] .. ").")
-
+                        local saved = (not LoadedFromDisk[guid]) and load_inventory_data(guid)
+                        if saved then
+                            populate_inventory(second_inv, saved)
+                            LoadedFromDisk[guid] = true
+                            log("Restored from disk save.")
                         else
-                            local saved = load_inventory_data(guid)
-                            if saved then
-                                populate_inventory(second_inv, saved)
-                                log("Restored from disk.")
-                            else
-                                -- First ever open.
-                                local ok_seed = pcall(function()
-                                    second_inv:SetPropertyValue("JsonInventory", EMPTY_INV_JSON)
-                                end)
-                                if ok_seed then log("Seeded empty inventory (first open).") end
+                            -- ItemSlots is already pre-allocated from construction seed.
+                            -- Just refresh JsonInventory string so UI stays at 40 slots.
+                            local ok_layout = pcall(function()
+                                second_inv:SetPropertyValue("JsonInventory", SLOT_LAYOUT_JSON)
+                            end)
+                            if ok_layout then
+                                log("Refreshed layout JSON (40 slots, ItemSlots untouched).")
                             end
                         end
 

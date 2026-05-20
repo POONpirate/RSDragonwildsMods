@@ -94,6 +94,196 @@ local function json_path(guid)
 end
 
 -- -----------------------------------------------------------------------------
+-- Manual ItemSlots serialization
+-- -----------------------------------------------------------------------------
+-- The engine never writes item data back into JsonInventory for our dynamic
+-- component — only the game's native save system does that, and our component
+-- isn't registered with it.  So we iterate ItemSlots ourselves and build the
+-- JSON string manually at save time.
+--
+-- TArray userdata uses 1-based indexing in Lua (sv[0] errors, sv[1] succeeds).
+-- FItemSlot property names come from the observed JsonInventory key format:
+-- "GUID", "ItemData", "Count".
+
+-- ---------------------------------------------------------------------------
+-- GUID helpers
+-- ---------------------------------------------------------------------------
+-- FGuid has sub-fields A, B, C, D (each uint32).  GetPropertyValue returns an
+-- FGuid userdata whose :ToString() often fails, so we read the raw components.
+local function read_fguid(gv)
+    if gv == nil then return "" end
+    if type(gv) == "string" then
+        return (gv ~= "" and gv ~= "00000000-00000000-00000000-00000000") and gv or ""
+    end
+    -- Try :ToString() first (works on some builds).
+    local ok_ts, ts = pcall(function() return gv:ToString() end)
+    if ok_ts and ts and ts ~= "" and ts ~= "00000000-00000000-00000000-00000000"
+       and ts ~= "00000000000000000000000000000000" then
+        return ts
+    end
+    -- Fall back to reading raw A/B/C/D sub-fields.
+    local ok_a, a = pcall(function() return gv.A end)
+    local ok_b, b = pcall(function() return gv.B end)
+    local ok_c, c = pcall(function() return gv.C end)
+    local ok_d, d = pcall(function() return gv.D end)
+    if ok_a and ok_b and ok_c and ok_d then
+        a, b, c, d = tonumber(a) or 0, tonumber(b) or 0,
+                     tonumber(c) or 0, tonumber(d) or 0
+        if a == 0 and b == 0 and c == 0 and d == 0 then return "" end
+        return string.format("%08X%08X%08X%08X", a, b, c, d)
+    end
+    return ""
+end
+
+-- ---------------------------------------------------------------------------
+-- Force-JSON helpers — try calling component functions that might serialize
+-- ItemSlots back into JsonInventory (the way the game's own save path does).
+-- ---------------------------------------------------------------------------
+local FORCE_JSON_FNS = {
+    "UpdateJsonInventory", "RefreshJsonInventory", "GenerateJsonInventory",
+    "SerializeToJson",     "BuildJsonInventory",   "WriteInventoryJson",
+    "SyncJsonInventory",   "PackInventory",        "InvalidateJson",
+    "ForceJsonUpdate",     "SaveInventoryToJson",  "CommitInventory",
+}
+local function try_force_json(inv_comp)
+    for _, fn in ipairs(FORCE_JSON_FNS) do
+        pcall(function() inv_comp[fn](inv_comp) end)
+    end
+    -- Check if JsonInventory now has real item data.
+    local ok_j, j_str = pcall(function()
+        return inv_comp:GetPropertyValue("JsonInventory"):ToString()
+    end)
+    if ok_j and j_str and #j_str > 200
+       and j_str ~= EMPTY_INV_JSON and j_str ~= SLOT_LAYOUT_JSON then
+        log("force_json: got item data! len=" .. #j_str .. "  preview=" .. j_str:sub(1,80))
+        return j_str
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Slot-level probe (runs once per session after items might be present)
+-- ---------------------------------------------------------------------------
+local _probe_cast = 0
+local function probe_slot(sv, label)
+    -- Try every field name two ways and log what returns a non-trivial value.
+    local names = { "GUID", "ItemData", "Count", "ItemId", "ItemClass",
+                    "ItemType", "ItemName", "Item", "Data", "InstanceId",
+                    "UniqueId", "Amount", "Index", "RowHandle" }
+    local findings = {}
+    for _, n in ipairs(names) do
+        local ok_gp, gv = pcall(function() return sv:GetPropertyValue(n) end)
+        if ok_gp and gv ~= nil then
+            -- Try to get a printable preview.
+            local preview = type(gv)
+            local ok_ts, ts = pcall(function() return gv:ToString() end)
+            if ok_ts and ts and ts ~= "" then preview = ts:sub(1,30)
+            else
+                local ok_a, a = pcall(function() return gv.A end)
+                if ok_a and tonumber(a) then
+                    local ok_b, b = pcall(function() return gv.B end)
+                    local ok_c, c = pcall(function() return gv.C end)
+                    local ok_d, d = pcall(function() return gv.D end)
+                    preview = string.format("FGuid(%s,%s,%s,%s)",
+                        tostring(a),tostring(b),tostring(c),tostring(d))
+                end
+            end
+            findings[#findings+1] = n .. "=" .. preview
+        end
+    end
+    log(label .. ": " .. (#findings > 0 and table.concat(findings, " | ") or "nothing readable"))
+end
+
+-- ---------------------------------------------------------------------------
+-- Main serializer
+-- ---------------------------------------------------------------------------
+local function serialize_item_slots(inv_comp)
+    -- 1. Try calling functions that might update JsonInventory from ItemSlots.
+    local forced = try_force_json(inv_comp)
+    if forced then return forced end
+
+    local ok_s, sv = pcall(function()
+        return inv_comp:GetPropertyValue("ItemSlots")
+    end)
+    if not ok_s or sv == nil then
+        log("serialize: ItemSlots read failed")
+        return nil
+    end
+
+    -- 2. Probe a few slots with detailed field inspection (every other cast).
+    _probe_cast = _probe_cast + 1
+    if _probe_cast <= 3 then
+        local ok_1, s1 = pcall(function() return sv[1] end)
+        if ok_1 and s1 then probe_slot(s1, "probe sv[1]") end
+        -- Also probe index 2 in case slot 1 is our seeded empty entry.
+        local ok_2, s2 = pcall(function() return sv[2] end)
+        if ok_2 and s2 then probe_slot(s2, "probe sv[2]") end
+    end
+
+    -- 3. Walk ItemSlots and build JSON from any occupied (non-zero GUID) slots.
+    local parts   = { '{"Version":67' }
+    local max_idx = -1
+
+    for i = 1, SECOND_INV_SLOTS do
+        local ok_slot, slot = pcall(function() return sv[i] end)
+        if not ok_slot or slot == nil then
+            log("serialize: sv[" .. i .. "] unavailable — stopping.")
+            break
+        end
+
+        -- GUID: try GetPropertyValue, then sub-fields A/B/C/D.
+        local guid_str = ""
+        local ok_g, gv = pcall(function() return slot:GetPropertyValue("GUID") end)
+        if ok_g and gv ~= nil then guid_str = read_fguid(gv) end
+
+        if guid_str == "" or guid_str == EMPTY_GUID then goto continue end
+
+        -- ItemData (FString — try ToString, then direct string coerce).
+        local item_data_str = ""
+        local ok_d, dv = pcall(function() return slot:GetPropertyValue("ItemData") end)
+        if ok_d and dv ~= nil then
+            local ok_ts, ts = pcall(function()
+                return type(dv) == "string" and dv or dv:ToString()
+            end)
+            item_data_str = (ok_ts and ts) or ""
+        end
+
+        -- Count (int32 — try tonumber directly, then .Value sub-field).
+        local count_val = 1
+        local ok_c, cv = pcall(function() return slot:GetPropertyValue("Count") end)
+        if ok_c and cv ~= nil then
+            local n = tonumber(cv)
+            if n then
+                count_val = n
+            else
+                local ok_v, v = pcall(function() return cv.Value end)
+                if ok_v and v then count_val = tonumber(v) or 1 end
+            end
+        end
+
+        local json_idx = i - 1
+        parts[#parts + 1] = string.format(
+            ',"%d":{"GUID":"%s","ItemData":"%s","Count":%d}',
+            json_idx, guid_str, item_data_str:gsub('"', '\\"'), count_val)
+        max_idx = json_idx
+        log(string.format("serialize: slot %d  GUID=%s  Count=%d",
+            json_idx, guid_str:sub(1, 16), count_val))
+
+        ::continue::
+    end
+
+    if max_idx < 0 then
+        log("serialize: no items found (GUID sub-fields all zero or unreadable).")
+        return nil
+    end
+
+    parts[#parts + 1] = string.format(',"MaxSlotIndex":%d,"AllowAdds":false}', SECOND_INV_SLOTS - 1)
+    local result = table.concat(parts)
+    log("serialize: built JSON (" .. #result .. " bytes).")
+    return result
+end
+
+-- -----------------------------------------------------------------------------
 -- JSON persistence
 -- -----------------------------------------------------------------------------
 
@@ -114,33 +304,47 @@ end
 local function save_inventory_data(guid, inv_comp, fallback_json)
     if not inv_comp or not inv_comp:IsValid() then return end
 
+    local to_write = nil
+
+    -- Priority 1: manually serialize ItemSlots → JSON.
+    -- This is the primary path because the engine never writes item data back into
+    -- JsonInventory for our dynamic component.
+    to_write = serialize_item_slots(inv_comp)
+
+    -- Priority 2: live JsonInventory (populated if the engine did serialize it).
+    if not to_write then
+        local ok_json, json_str = pcall(function()
+            return inv_comp:GetPropertyValue("JsonInventory"):ToString()
+        end)
+        log("save: live JsonInventory len=" .. (ok_json and json_str and tostring(#json_str) or "err"))
+        if ok_json and json_str and json_str ~= ""
+           and json_str ~= SLOT_LAYOUT_JSON and json_str ~= EMPTY_INV_JSON then
+            to_write = json_str
+            log("save: using live JsonInventory.")
+        end
+    end
+
+    -- Priority 3: cached snapshot captured from the post-open hook.
+    if not to_write and fallback_json and fallback_json ~= ""
+       and fallback_json ~= SLOT_LAYOUT_JSON and fallback_json ~= EMPTY_INV_JSON then
+        to_write = fallback_json
+        log("save: using cached fallback JSON.")
+    end
+
+    if not to_write then
+        log("save: inventory is empty — nothing written for GUID " .. guid)
+        return
+    end
+
     local path = json_path(guid)
     local file = io.open(path, "w")
     if not file then
         log_err("Could not open save file for writing: " .. path)
         return
     end
-
-    local ok_json, json_str = pcall(function()
-        return inv_comp:GetPropertyValue("JsonInventory"):ToString()
-    end)
-
-    if ok_json and json_str and json_str ~= "" and json_str ~= SLOT_LAYOUT_JSON and json_str ~= EMPTY_INV_JSON then
-        file:write(json_str)
-        file:close()
-        log("Saved inventory (live) for GUID " .. guid)
-        return
-    end
-
-    if fallback_json and fallback_json ~= "" and fallback_json ~= SLOT_LAYOUT_JSON and fallback_json ~= EMPTY_INV_JSON then
-        file:write(fallback_json)
-        file:close()
-        log("Saved inventory (cached) for GUID " .. guid)
-        return
-    end
-
+    file:write(to_write)
     file:close()
-    log("Inventory is empty — nothing written for GUID " .. guid)
+    log("Saved inventory for GUID " .. guid .. " (" .. #to_write .. " bytes).")
 end
 
 local function save_all_inventories()
@@ -350,7 +554,10 @@ for _, hook_path in ipairs(GAME_SAVE_HOOKS) do
     local ok = pcall(function()
         RegisterHook(hook_path,
             function() end,
-            function() ExecuteInGameThread(save_all_inventories) end
+            function()
+                log("Game save hook fired: " .. hook_path)
+                ExecuteInGameThread(save_all_inventories)
+            end
         )
     end)
     if ok then log("Save hook registered: " .. hook_path) end
@@ -381,30 +588,35 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
             RegisterHook("/Script/Dominion.PersonalInventoryComponent:OpenPersonalInventory",
                 function(self, p1, char_obj) end,
                 function(self, p1, char_obj)
-                    local ok_get, comp = pcall(function() return self:get() end)
-                    if not ok_get or not comp or not comp:IsValid() then return end
+                    -- self is a RemoteUnrealParam — always use self:get() to reach the UObject.
+                    local comp = nil
+                    pcall(function()
+                        local c = self:get()
+                        if c and c:IsValid() then comp = c end
+                    end)
+                    if not comp then return end
+
                     local ok_nm, nm = pcall(function() return comp:GetName() end)
                     if not ok_nm or not nm or not nm:find("SecondPersonalInventory") then return end
+                    log("OPI post-hook: matched " .. nm)
 
-                    ExecuteInGameThread(function()
-                        -- Read JsonInventory after OpenPersonalInventory ran.
-                        local ok_j, j_str = pcall(function()
-                            return comp:GetPropertyValue("JsonInventory"):ToString()
-                        end)
-                        local preview = (ok_j and j_str) and j_str:sub(1, 200) or "(unavailable)"
-                        log("JsonInventory after open: " .. preview)
-
-                        -- Patch MaxSlotIndex → 39 (if engine overwrote it) and broadcast
-                        -- so the live UI refreshes to 40 slots.
-                        if ok_j and j_str and j_str ~= "" then
-                            local patched = j_str:gsub('"MaxSlotIndex":%d+', '"MaxSlotIndex":' .. (SECOND_INV_SLOTS - 1))
-                            populate_inventory(comp, patched)
-                            log("Post-open: patched MaxSlotIndex→39 and broadcast.")
-                        else
-                            populate_inventory(comp, SLOT_LAYOUT_JSON)
-                            log("Post-open: broadcast SLOT_LAYOUT_JSON (no existing JSON).")
-                        end
+                    -- Read JsonInventory after OpenPersonalInventory ran.
+                    local ok_j, j_str = pcall(function()
+                        return comp:GetPropertyValue("JsonInventory"):ToString()
                     end)
+                    local preview = (ok_j and j_str) and j_str:sub(1, 200) or "(unavailable)"
+                    log("OPI post-hook: JsonInventory after open = " .. preview)
+
+                    -- Patch MaxSlotIndex → 39 (if engine overwrote it) and broadcast
+                    -- so the live UI refreshes to 40 slots.
+                    if ok_j and j_str and j_str ~= "" then
+                        local patched = j_str:gsub('"MaxSlotIndex":%d+', '"MaxSlotIndex":' .. (SECOND_INV_SLOTS - 1))
+                        populate_inventory(comp, patched)
+                        log("OPI post-hook: patched MaxSlotIndex→39 and broadcast.")
+                    else
+                        populate_inventory(comp, SLOT_LAYOUT_JSON)
+                        log("OPI post-hook: broadcast SLOT_LAYOUT_JSON (no existing JSON).")
+                    end
                 end
             )
         end)
@@ -497,6 +709,12 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
                         local second_inv = get_or_create_second_inventory(guid, ctrl)
                         if not second_inv then return end
+
+                        -- Persist on every open so items are never lost between sessions.
+                        -- On first cast the component is freshly constructed (no items) so
+                        -- save_inventory_data writes nothing.  On second+ cast this captures
+                        -- everything placed since the last save.
+                        save_inventory_data(guid, second_inv, CachedInventoryJson[guid])
 
                         -- JsonInventory controls grid layout (how many slots the UI renders).
                         -- ItemSlots holds actual item data and persists in-memory on the

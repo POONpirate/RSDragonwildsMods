@@ -61,10 +61,11 @@ local SAVE_DIR = nil
 -- FindAllOf returns a new Lua proxy object each call even for the same underlying
 -- UObject, so using ctrl as a table key always misses on subsequent casts.
 
-local SecondInventories  = {}  -- guid → PersonalInventoryComponent
-local ControllersByGuid  = {}  -- guid → ctrl  (kept for open/save calls)
-local CachedInventoryJson = {} -- guid → json string (captured from component between casts)
-local LoadedFromDisk     = {}  -- guid → true once disk save has been restored this session
+local SecondInventories   = {}  -- guid → PersonalInventoryComponent
+local ControllersByGuid   = {}  -- guid → ctrl  (kept for open/save calls)
+local CachedInventoryJson = {}  -- guid → json string (captured from component between casts)
+local LoadedFromDisk      = {}  -- guid → true once disk save has been restored this session
+local PendingRestoreData  = {}  -- guid → json string; consumed by OPI post-hook after OpenPersonalInventory runs
 
 -- -----------------------------------------------------------------------------
 -- Logging helpers
@@ -127,8 +128,13 @@ local function read_fguid(gv)
     local ok_c, c = pcall(function() return gv.C end)
     local ok_d, d = pcall(function() return gv.D end)
     if ok_a and ok_b and ok_c and ok_d then
-        a, b, c, d = tonumber(a) or 0, tonumber(b) or 0,
-                     tonumber(c) or 0, tonumber(d) or 0
+        -- Mask to 32 bits: UE4SS may return uint32 as a sign-extended int64.
+        -- Without masking, string.format("%08X", -1) → "FFFFFFFFFFFFFFFF" (16 chars)
+        -- instead of "FFFFFFFF" (8 chars), producing malformed 40/48-char GUIDs.
+        a = (tonumber(a) or 0) & 0xFFFFFFFF
+        b = (tonumber(b) or 0) & 0xFFFFFFFF
+        c = (tonumber(c) or 0) & 0xFFFFFFFF
+        d = (tonumber(d) or 0) & 0xFFFFFFFF
         if a == 0 and b == 0 and c == 0 and d == 0 then return "" end
         return string.format("%08X%08X%08X%08X", a, b, c, d)
     end
@@ -166,7 +172,7 @@ end
 -- ---------------------------------------------------------------------------
 local _probe_cast = 0
 local function probe_slot(sv, label)
-    -- Try every field name two ways and log what returns a non-trivial value.
+    -- GetPropertyValue pass: try reading each known field name.
     local names = { "GUID", "ItemData", "Count", "ItemId", "ItemClass",
                     "ItemType", "ItemName", "Item", "Data", "InstanceId",
                     "UniqueId", "Amount", "Index", "RowHandle" }
@@ -174,7 +180,6 @@ local function probe_slot(sv, label)
     for _, n in ipairs(names) do
         local ok_gp, gv = pcall(function() return sv:GetPropertyValue(n) end)
         if ok_gp and gv ~= nil then
-            -- Try to get a printable preview.
             local preview = type(gv)
             local ok_ts, ts = pcall(function() return gv:ToString() end)
             if ok_ts and ts and ts ~= "" then preview = ts:sub(1,30)
@@ -191,7 +196,42 @@ local function probe_slot(sv, label)
             findings[#findings+1] = n .. "=" .. preview
         end
     end
-    log(label .. ": " .. (#findings > 0 and table.concat(findings, " | ") or "nothing readable"))
+    log(label .. " GetPropertyValue: " .. (#findings > 0 and table.concat(findings, " | ") or "nothing"))
+
+    -- Direct dot-notation pass (may use a different __index path than GetPropertyValue).
+    local dot_findings = {}
+    for _, n in ipairs(names) do
+        local ok_dn, dv = pcall(function() return sv[n] end)
+        if ok_dn and dv ~= nil then
+            local t = type(dv)
+            local val = t ~= "userdata" and tostring(dv) or "userdata"
+            if t == "userdata" then
+                local ok_ts, ts = pcall(function() return dv:ToString() end)
+                if ok_ts and ts and ts ~= "" then val = ts:sub(1,30) end
+            end
+            dot_findings[#dot_findings+1] = n .. "=" .. val
+        end
+    end
+    log(label .. " dot-notation:     " .. (#dot_findings > 0 and table.concat(dot_findings, " | ") or "nothing"))
+
+    -- Deep probe on ItemData: try UObject methods (IsValid, GetPathName, GetClass).
+    -- tostring() returns "UObject: 0x..." for both empty and occupied slots because
+    -- UE4SS wraps FItemSlot sub-field accesses in dummy Lua objects.  We need to check
+    -- whether this "UObject" is actually valid and points to a real asset.
+    local ok_id, id_udata = pcall(function() return sv:GetPropertyValue("ItemData") end)
+    if ok_id and id_udata ~= nil and type(id_udata) == "userdata" then
+        local ok_iv, is_v = pcall(function() return id_udata:IsValid() end)
+        log(label .. " ItemData:IsValid() = " .. (ok_iv and tostring(is_v) or "(error)"))
+        if ok_iv and is_v then
+            local ok_pn, pn = pcall(function() return id_udata:GetPathName() end)
+            log(label .. " ItemData:GetPathName() = " .. (ok_pn and tostring(pn) or "(error)"))
+            local ok_cls, cls = pcall(function()
+                return id_udata:GetClass():GetName()
+            end)
+            log(label .. " ItemData:GetClass():GetName() = " .. (ok_cls and tostring(cls) or "(error)"))
+        end
+        log(label .. " tostring(ItemData) = " .. tostring(id_udata))
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -212,7 +252,7 @@ local function serialize_item_slots(inv_comp)
 
     -- 2. Probe a few slots with detailed field inspection (every other cast).
     _probe_cast = _probe_cast + 1
-    if _probe_cast <= 3 then
+    if _probe_cast <= 5 then
         local ok_1, s1 = pcall(function() return sv[1] end)
         if ok_1 and s1 then probe_slot(s1, "probe sv[1]") end
         -- Also probe index 2 in case slot 1 is our seeded empty entry.
@@ -238,26 +278,132 @@ local function serialize_item_slots(inv_comp)
 
         if guid_str == "" or guid_str == EMPTY_GUID then goto continue end
 
-        -- ItemData (FString — try ToString, then direct string coerce).
+        -- Deep probe this occupied slot's ItemData with exhaustive method + field sweep.
+        -- IsValid()=true for occupied slots but GetPathName/GetClass fail (it's an FStruct,
+        -- not a real UObject).  Sweep every plausible method and sub-field to find the
+        -- string form of the item type reference.
+        if _probe_cast <= 5 then
+            local ok_dp, dp = pcall(function() return slot:GetPropertyValue("ItemData") end)
+            if ok_dp and dp ~= nil then
+                log("=== ItemData sweep for occupied slot " .. (i-1) .. " ===")
+                -- Method sweep
+                local methods = {
+                    "ToString",          "GetFName",           "GetName",
+                    "GetPath",           "GetAssetPathString", "GetLongPackageName",
+                    "GetAssetName",      "GetPackageName",     "IsNull",
+                    "GetTagName",        "GetTagValue",        "GetValue",
+                    "GetCurrentTag",     "GetRowName",         "GetType",
+                    "GetItemId",         "GetShortDescription","GetDescription",
+                    "ToSoftObjectPath",  "GetSoftObjectPath",  "GetStringValue",
+                }
+                for _, m in ipairs(methods) do
+                    local ok_m, v = pcall(function()
+                        local fn = dp[m]
+                        if type(fn) == "function" then return fn(dp) end
+                        return fn
+                    end)
+                    if ok_m and v ~= nil then
+                        local vt = type(v)
+                        local vs = vt ~= "userdata" and tostring(v) or "userdata"
+                        if vt == "userdata" then
+                            local ok_ts2, ts2 = pcall(function() return v:ToString() end)
+                            if ok_ts2 and ts2 and ts2 ~= "" then vs = "[" .. ts2 .. "]" end
+                        end
+                        if vs ~= "" and vs ~= "nil" and vs ~= "false" then
+                            log("  ItemData." .. m .. "() [" .. vt .. "] = " .. vs)
+                        end
+                    end
+                end
+                -- Sub-field (direct index) sweep
+                local fields = {
+                    "AssetPath",    "SubPathString", "PackageName",  "AssetName",
+                    "ObjectPath",   "RowName",       "DataTable",    "Tag",
+                    "TagName",      "Type",          "Name",         "Id",
+                    "Handle",       "Key",           "Path",         "Class",
+                    "SoftPath",     "SoftClass",     "ItemHandle",   "Definition",
+                }
+                for _, f in ipairs(fields) do
+                    local ok_f, v = pcall(function() return dp[f] end)
+                    if ok_f and v ~= nil then
+                        local vt = type(v)
+                        local vs = vt ~= "userdata" and tostring(v) or "userdata"
+                        if vt == "userdata" then
+                            local ok_ts2, ts2 = pcall(function() return v:ToString() end)
+                            if ok_ts2 and ts2 and ts2 ~= "" then vs = "[" .. ts2 .. "]" end
+                        end
+                        log("  ItemData['" .. f .. "'] [" .. vt .. "] = " .. vs)
+                    end
+                end
+                -- GetFName confirmed working; GetFullName() confirmed to return full asset path.
+                -- GetOuter() loop REMOVED — it traverses invalid memory and crashes the game.
+                local ok_fn2, fn2 = pcall(function() return dp:GetFName() end)
+                if ok_fn2 and fn2 then
+                    local ok_ts2, ts2 = pcall(function() return fn2:ToString() end)
+                    if ok_ts2 and ts2 and ts2 ~= "" then
+                        log("  ItemData.GetFName() = " .. ts2)
+                    end
+                end
+
+                -- GetFullName() returns "ClassName /Full/Path.ObjectName" — log the full string.
+                local ok_gfn, gfn = pcall(function() return dp:GetFullName() end)
+                if ok_gfn and gfn and gfn ~= "" then
+                    log("  ItemData.GetFullName() = " .. tostring(gfn))
+                    local path_part = gfn:match("^%S+%s+(.+)$")
+                    if path_part then
+                        log("  ItemData parsed path = " .. path_part)
+                    end
+                end
+            end
+        end
+
+        -- ItemData: primary path is GetFullName() → parse the asset path component.
+        -- GetFullName() returns "ClassName /Game/Full/Path.ObjectName" — split on first
+        -- space to get "/Game/Full/Path.ObjectName", which the engine accepts as a soft
+        -- object reference and uses to restore items across sessions.
+        -- Fallback: GetFName():ToString() → short name only (items won't restore on reload).
         local item_data_str = ""
         local ok_d, dv = pcall(function() return slot:GetPropertyValue("ItemData") end)
         if ok_d and dv ~= nil then
-            local ok_ts, ts = pcall(function()
-                return type(dv) == "string" and dv or dv:ToString()
-            end)
-            item_data_str = (ok_ts and ts) or ""
+            if type(dv) == "string" then
+                item_data_str = dv
+            else
+                -- Primary: GetFullName() → parse full asset path
+                local ok_gfn, gfn = pcall(function() return dv:GetFullName() end)
+                if ok_gfn and gfn and gfn ~= "" then
+                    local path_part = gfn:match("^%S+%s+(.+)$")
+                    if path_part and path_part ~= "" then
+                        item_data_str = path_part
+                        log("serialize: ItemData (full path) = " .. path_part)
+                    end
+                end
+                -- Fallback: GetFName():ToString() → short row name
+                if item_data_str == "" then
+                    local ok_fn, fn = pcall(function() return dv:GetFName() end)
+                    if ok_fn and fn ~= nil then
+                        local ok_ts, ts = pcall(function() return fn:ToString() end)
+                        if ok_ts and ts and ts ~= "" and ts ~= "None" then
+                            item_data_str = ts
+                            log("serialize: ItemData (fallback FName) = " .. ts)
+                        end
+                    end
+                end
+            end
         end
 
-        -- Count (int32 — try tonumber directly, then .Value sub-field).
+        -- Count: returns a real Lua number for occupied slots (confirmed on cast 2).
+        -- Empty slots return garbage userdata, but we only reach this code for non-empty
+        -- slots (non-zero GUID), so GetPropertyValue should give us the real int32 value.
         local count_val = 1
         local ok_c, cv = pcall(function() return slot:GetPropertyValue("Count") end)
         if ok_c and cv ~= nil then
             local n = tonumber(cv)
-            if n then
-                count_val = n
-            else
-                local ok_v, v = pcall(function() return cv.Value end)
-                if ok_v and v then count_val = tonumber(v) or 1 end
+            if n then count_val = n end
+        end
+        if count_val == 1 then  -- dot-notation fallback
+            local ok_dn, dn = pcall(function() return slot.Count end)
+            if ok_dn and dn ~= nil then
+                local n = tonumber(dn)
+                if n then count_val = n end
             end
         end
 
@@ -588,34 +734,39 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
             RegisterHook("/Script/Dominion.PersonalInventoryComponent:OpenPersonalInventory",
                 function(self, p1, char_obj) end,
                 function(self, p1, char_obj)
-                    -- self is a RemoteUnrealParam — always use self:get() to reach the UObject.
-                    local comp = nil
-                    pcall(function()
-                        local c = self:get()
-                        if c and c:IsValid() then comp = c end
-                    end)
-                    if not comp then return end
+                    -- NOTE: In UE4SS native post-hooks self wraps the function's return value
+                    -- (void → nullptr), NOT the component instance.  self:get():GetName() always
+                    -- crashes.  We identify which component to restore via PendingRestoreData,
+                    -- which the Eye of Oculus hook sets just before calling open_second_inventory_ui.
+                    log("OPI post-hook: fired — consuming PendingRestoreData.")
 
-                    local ok_nm, nm = pcall(function() return comp:GetName() end)
-                    if not ok_nm or not nm or not nm:find("SecondPersonalInventory") then return end
-                    log("OPI post-hook: matched " .. nm)
+                    -- Snapshot pending work and clear the table before processing so that
+                    -- any re-entrant calls see an empty table.
+                    local to_restore = {}
+                    for guid, json in pairs(PendingRestoreData) do
+                        to_restore[guid] = json
+                    end
+                    PendingRestoreData = {}
 
-                    -- Read JsonInventory after OpenPersonalInventory ran.
-                    local ok_j, j_str = pcall(function()
-                        return comp:GetPropertyValue("JsonInventory"):ToString()
-                    end)
-                    local preview = (ok_j and j_str) and j_str:sub(1, 200) or "(unavailable)"
-                    log("OPI post-hook: JsonInventory after open = " .. preview)
-
-                    -- Patch MaxSlotIndex → 39 (if engine overwrote it) and broadcast
-                    -- so the live UI refreshes to 40 slots.
-                    if ok_j and j_str and j_str ~= "" then
-                        local patched = j_str:gsub('"MaxSlotIndex":%d+', '"MaxSlotIndex":' .. (SECOND_INV_SLOTS - 1))
-                        populate_inventory(comp, patched)
-                        log("OPI post-hook: patched MaxSlotIndex→39 and broadcast.")
-                    else
-                        populate_inventory(comp, SLOT_LAYOUT_JSON)
-                        log("OPI post-hook: broadcast SLOT_LAYOUT_JSON (no existing JSON).")
+                    local any = false
+                    for guid, json in pairs(to_restore) do
+                        local comp = SecondInventories[guid]
+                        if comp then
+                            local ok_v, is_v = pcall(function() return comp:IsValid() end)
+                            if ok_v and is_v then
+                                log("OPI post-hook: restoring items for GUID=" .. guid:sub(1, 16) .. "...")
+                                populate_inventory(comp, json)
+                                log("OPI post-hook: restore broadcast sent.")
+                                any = true
+                            else
+                                log("OPI post-hook: comp invalid for GUID=" .. guid:sub(1, 16))
+                            end
+                        else
+                            log("OPI post-hook: no comp stored for GUID=" .. guid:sub(1, 16))
+                        end
+                    end
+                    if not any then
+                        log("OPI post-hook: nothing to restore.")
                     end
                 end
             )
@@ -640,6 +791,76 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
         end)
         if ok_oa then log("OculusComponent:ActivateOculus hook registered.")
         else log_err("Could not hook ActivateOculus.") end
+
+        -- -----------------------------------------------------------------------
+        -- Item-movement hooks: brute-force discovery
+        -- We don't know which UFunction gets called when an item is dragged into
+        -- our second inventory.  Register hooks for every plausible name; log
+        -- which ones succeed and, crucially, what parameters arrive when they fire
+        -- on our SecondPersonalInventory component.  The parameter that carries
+        -- item type/class info is what we need to capture as "ItemData".
+        -- -----------------------------------------------------------------------
+        local ITEM_HOOKS = {
+            "AddItem",          "TryAddItem",       "ServerAddItem",
+            "AddItemToSlot",    "MoveItemToSlot",   "SetItemInSlot",
+            "PlaceItemInSlot",  "InsertItem",       "PutItem",
+            "OnItemAdded",      "OnSlotUpdated",    "OnInventoryChanged",
+            "SwapItems",        "SwapItemSlots",    "MoveItem",
+            "ServerMoveItem",   "PickupItem",       "ReceiveItem",
+            "SetSlotContent",   "UpdateSlot",
+        }
+        local item_hook_count = 0
+        for _, fn_name in ipairs(ITEM_HOOKS) do
+            local hook_path = "/Script/Dominion.PersonalInventoryComponent:" .. fn_name
+            local ok_ih = pcall(function()
+                RegisterHook(hook_path,
+                    function(self, ...)
+                        -- Pre-hook: log whenever this fires on our inventory.
+                        local comp = nil
+                        pcall(function()
+                            local c = self:get()
+                            if c and c:IsValid() then comp = c end
+                        end)
+                        if not comp then return end
+                        local ok_nm, nm = pcall(function() return comp:GetName() end)
+                        if not ok_nm or not nm or not nm:find("SecondPersonalInventory") then return end
+
+                        -- Count and type-inspect parameters.
+                        local args = { ... }
+                        log("ITEM_HOOK pre [" .. fn_name .. "] fired on SecondPersonalInventory, "
+                            .. #args .. " params:")
+                        for i, p in ipairs(args) do
+                            local pt = type(p)
+                            local pval = pt ~= "userdata" and tostring(p) or "userdata"
+                            -- Try common UObject methods.
+                            if pt == "userdata" then
+                                local ok_g, pv = pcall(function() return p:get() end)
+                                if ok_g and pv ~= nil then
+                                    pt = "RemoteUnrealParam"
+                                    local ok_cls, cls = pcall(function() return pv:GetClass():GetName() end)
+                                    local ok_pn, pn   = pcall(function() return pv:GetPathName()         end)
+                                    local ok_nm2, nm2  = pcall(function() return pv:GetName()            end)
+                                    pval = string.format("cls=%s path=%s name=%s",
+                                        ok_cls and cls or "?",
+                                        ok_pn  and pn  or "?",
+                                        ok_nm2 and nm2 or "?")
+                                else
+                                    local ok_ts, ts = pcall(function() return p:ToString() end)
+                                    if ok_ts and ts and ts ~= "" then pval = ts:sub(1, 60) end
+                                end
+                            end
+                            log("  param[" .. i .. "] type=" .. pt .. " val=" .. pval)
+                        end
+                    end,
+                    function(self, ...) end   -- post-hook (empty)
+                )
+            end)
+            if ok_ih then
+                item_hook_count = item_hook_count + 1
+                log("Item hook registered: " .. fn_name)
+            end
+        end
+        log("Item-movement hooks registered: " .. item_hook_count .. " / " .. #ITEM_HOOKS)
 
         local reg_ok, reg_err = pcall(function()
             RegisterHook(SPELL_HOOK,
@@ -696,6 +917,38 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                         log("Controller found, GUID=" .. guid)
                         ControllersByGuid[guid] = ctrl
 
+                        -- Spy on all PersonalInventoryComponents to learn real JSON format.
+                        -- The real chest's JsonInventory shows us what valid ItemData looks like.
+                        -- Only log the first time (or first few times) to avoid log spam.
+                        if _probe_cast <= 5 then
+                            local ok_all, all_pics = pcall(function()
+                                return FindAllOf("PersonalInventoryComponent")
+                            end)
+                            if ok_all and all_pics then
+                                for _, pic in ipairs(all_pics) do
+                                    if pic:IsValid() then
+                                        local ok_nm, nm = pcall(function() return pic:GetName() end)
+                                        local nm_str = (ok_nm and nm) or "?"
+                                        if not nm_str:find("SecondPersonalInventory") then
+                                            local ok_j, j = pcall(function()
+                                                return pic:GetPropertyValue("JsonInventory"):ToString()
+                                            end)
+                                            if ok_j and j and j ~= "" and j ~= SLOT_LAYOUT_JSON
+                                               and j ~= EMPTY_INV_JSON then
+                                                -- Show the first 400 chars so we can see item entries.
+                                                log("REAL inv [" .. nm_str .. "] len=" .. #j
+                                                    .. "  preview=" .. j:sub(1, 400))
+                                            else
+                                                log("REAL inv [" .. nm_str .. "] len="
+                                                    .. (ok_j and j and tostring(#j) or "err")
+                                                    .. " (empty/layout only)")
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+
                         local char_obj = nil
                         local ok_ch, chars = pcall(function() return FindAllOf("DominionPlayerCharacter") end)
                         if ok_ch and chars then
@@ -733,9 +986,16 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
                         local saved = (not LoadedFromDisk[guid]) and load_inventory_data(guid)
                         if saved then
+                            -- Set JsonInventory now so OpenPersonalInventory sees the right slot
+                            -- count (MaxSlotIndex:39) when it initialises the UI grid.
+                            -- We also queue the data in PendingRestoreData so the OPI post-hook
+                            -- can call populate_inventory AGAIN after OpenPersonalInventory runs —
+                            -- because OPI internally clears/reinitialises ItemSlots, wiping items
+                            -- that were placed by the Broadcast we fired here.
                             populate_inventory(second_inv, saved)
+                            PendingRestoreData[guid] = saved
                             LoadedFromDisk[guid] = true
-                            log("Restored from disk save.")
+                            log("Disk save loaded — queued post-OPI restore for GUID=" .. guid:sub(1, 16) .. "...")
                         else
                             -- Broadcast with SLOT_LAYOUT_JSON (MaxSlotIndex:39, no item entries)
                             -- on EVERY cast.  Goal: engine's OnInventoryLoadedFromSave handler

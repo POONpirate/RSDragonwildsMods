@@ -1,5 +1,5 @@
 -- ============================================================
---  HumidifyPlus v15 — UE4SS Lua Mod for RuneScape: Dragonwilds
+--  HumidifyPlus v16 — UE4SS Lua Mod for RuneScape: Dragonwilds
 --
 --  When Humidify is cast (regardless of weather):
 --    1. Waters plots — Clean Water if Cleansing Rain perk unlocked
@@ -178,13 +178,22 @@ local function buildPlotCache()
     dbg(string.format("Plot cache built: %d plots", #plots))
 end
 
--- Note: the original NotifyOnNewObject("/Script/Engine.Actor") hook that
--- auto-refreshed the plot cache on new plot construction was removed.
--- Hooking all Actor spawns during level load (e.g. on teleport) causes a
--- C++ crash when GetComponentByClass is called on mid-construction actors
--- before Lua pcall can intercept it.  The cache is already cleared in
--- refreshCoreCache() when the controller goes stale (every teleport), and
--- onHumidifyCast() rebuilds it on the next cast — so the hook is not needed.
+-- Hook FarmSlotComponent creation to invalidate the plot cache whenever a
+-- new farm plot is placed.  We use FarmSlotComponent (not the broad
+-- /Script/Engine.Actor class) so the callback fires ONLY for farm plot
+-- construction.  Critically, we do NOT call any methods on the incoming
+-- object — just nil the cache flag.  This avoids the C++ crash that
+-- occurred when the old /Script/Engine.Actor hook called GetComponentByClass
+-- on mid-construction actors during level load.  The actual rebuild happens
+-- safely and lazily on the next Humidify cast.
+try(function()
+    NotifyOnNewObject("/Script/Dominion.FarmSlotComponent",
+        function(_newComp)
+            -- Touch nothing on the component.  Assign to cache only.
+            cache.plots = nil
+            dbg("FarmSlotComponent constructed — plot cache invalidated")
+        end)
+end)
 
 -- ── Apply effects to one plot ─────────────────────────────────
 local function applyToPlot(plot, cmd, player, waterIndex, cleansingRain, done)
@@ -283,4 +292,4 @@ local hooked = try(function()
     return true
 end)
 
-print(string.format("[HumidifyPlus] v15.0 loaded (hook=%s).\n", tostring(hooked == true)))
+print(string.format("[HumidifyPlus] v16.0 loaded (hook=%s).\n", tostring(hooked == true)))

@@ -103,17 +103,22 @@ local function advanceWorldDay()
     -- Call ToggleRestingOrSleeping — same entry point as physical bed interaction.
     -- Parameters: Player Character (DominionPlayerCharacter), Player Controller (DominionPlayerController)
     -- Out param:  StartedRestingOrSleeping (bool) — true if sleep/rest began
-    local ok, started = pcall(function()
-        return bed:ToggleRestingOrSleeping(cache.player, cache.ctrl)
+    -- ToggleRestingOrSleeping has 3 UFunction params:
+    --   Player Character, Player Controller, StartedRestingOrSleeping (OutParm bool)
+    -- UE4SS requires out params to be passed as a Lua table, which gets filled on return.
+    local outParams = {}
+    local ok, err = pcall(function()
+        bed:ToggleRestingOrSleeping(cache.player, cache.ctrl, outParams)
     end)
 
     if ok then
+        local started = outParams.StartedRestingOrSleeping
         print(string.format("[QuickGrow] ToggleRestingOrSleeping called. StartedRestingOrSleeping=%s\n",
             tostring(started)))
         return true
     else
         print(string.format("[QuickGrow] ERROR calling ToggleRestingOrSleeping: %s\n",
-            tostring(started)))
+            tostring(err)))
         return false
     end
 end

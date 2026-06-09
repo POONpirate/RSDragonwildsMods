@@ -156,6 +156,93 @@ local function read_fguid(gv)
     return ""
 end
 
+-- Normalize any FGuid string form to bare upper-case 32-hex (strip dashes).
+local function norm_guid_hex(s)
+    if type(s) ~= "string" then return "" end
+    return (s:gsub("-", "")):upper()
+end
+
+-- Write a 32-hex GUID into a live FGuid userdata via sub-field assignment.
+-- Returns ok, detail. Handles uint32 values > INT32_MAX by retrying signed.
+local function write_fguid(gv, hex)
+    hex = norm_guid_hex(hex)
+    if #hex ~= 32 then return false, "bad hex len " .. #hex end
+    local vals = {}
+    for k = 0, 3 do
+        local v = tonumber(hex:sub(k * 8 + 1, k * 8 + 8), 16)
+        if not v then return false, "hex parse failed" end
+        vals[k + 1] = v
+    end
+    local fields = { "A", "B", "C", "D" }
+    for k = 1, 4 do
+        local v = vals[k]
+        local ok = pcall(function() gv[fields[k]] = v end)
+        if not ok and v >= 0x80000000 then
+            -- Retry as signed int32 in case the binding rejects large unsigned.
+            ok = pcall(function() gv[fields[k]] = v - 0x100000000 end)
+        end
+        if not ok then return false, "assign " .. fields[k] .. " failed" end
+    end
+    local back = norm_guid_hex(read_fguid(gv))
+    return back == hex, "read-back=" .. back
+end
+
+-- ---------------------------------------------------------------------------
+-- base64url (engine save format) helpers
+-- The game's PersonalInventory JSON stores GUID and ItemData as unpadded
+-- URL-safe base64 of 16 raw bytes (e.g. "aQlAB0Shj4Jxzvef5ZTF-w").
+-- ---------------------------------------------------------------------------
+local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+local B64_LOOKUP = {}
+for idx = 1, #B64_CHARS do B64_LOOKUP[B64_CHARS:sub(idx, idx)] = idx - 1 end
+
+local function b64url_decode(s)
+    if type(s) ~= "string" then return nil end
+    local bits, acc, nbits = {}, 0, 0
+    for ch in s:gmatch(".") do
+        local v = B64_LOOKUP[ch]
+        if v == nil then return nil end
+        acc = (acc << 6) | v
+        nbits = nbits + 6
+        if nbits >= 8 then
+            nbits = nbits - 8
+            bits[#bits + 1] = string.char((acc >> nbits) & 0xFF)
+        end
+    end
+    return table.concat(bits)
+end
+
+local function b64url_encode(bytes)
+    local out, acc, nbits = {}, 0, 0
+    for ch in bytes:gmatch(".") do
+        acc = (acc << 8) | ch:byte()
+        nbits = nbits + 8
+        while nbits >= 6 do
+            nbits = nbits - 6
+            out[#out + 1] = B64_CHARS:sub(((acc >> nbits) & 0x3F) + 1, ((acc >> nbits) & 0x3F) + 1)
+        end
+    end
+    if nbits > 0 then
+        out[#out + 1] = B64_CHARS:sub(((acc << (6 - nbits)) & 0x3F) + 1, ((acc << (6 - nbits)) & 0x3F) + 1)
+    end
+    return table.concat(out)
+end
+
+-- Diagnostic: render a b64url 16-byte GUID as hex two ways so we can match it
+-- against read_fguid output offline (byte order unknown until confirmed).
+local function b64_guid_hex_views(s)
+    local raw = b64url_decode(s)
+    if not raw or #raw ~= 16 then return "decode-failed(len=" .. tostring(raw and #raw) .. ")" end
+    local straight = (raw:gsub(".", function(c) return string.format("%02X", c:byte()) end))
+    -- LE-uint32 view: reverse bytes within each 4-byte group (FGuid A,B,C,D as little-endian).
+    local le_parts = {}
+    for g = 0, 3 do
+        local grp = raw:sub(g * 4 + 1, g * 4 + 4)
+        le_parts[#le_parts + 1] = (grp:reverse():gsub(".", function(c) return string.format("%02X", c:byte()) end))
+    end
+    return "raw=" .. straight .. " le32=" .. table.concat(le_parts)
+end
+
 -- ---------------------------------------------------------------------------
 -- Force-JSON helpers — try calling component functions that might serialize
 -- ItemSlots back into JsonInventory (the way the game's own save path does).
@@ -773,9 +860,13 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                                 populate_inventory(comp, restore_json)
                                 log("OPI post-hook: restore broadcast sent.")
 
-                                -- Diagnostic: check if ItemData is valid after broadcast.
-                                -- If IsValid=false the UI renders nothing even though GUID/Count are set.
-                                -- Attempt to fix via StaticFindObject + SetPropertyValue.
+                                -- Direct slot restore, driven by the saved JSON.
+                                -- CONFIRMED (2026-06-09): the engine's OnInventoryLoadedFromSave parser
+                                -- expects base64url 16-byte GUIDs for both GUID and ItemData (see the
+                                -- real PersonalInventory table in CharacterSave.json). Our hex/asset-path
+                                -- format is rejected wholesale, so the broadcast leaves every slot empty.
+                                -- Until we can write engine-format JSON, bypass the parser: write GUID,
+                                -- ItemData (resolved UObject), and Count directly into ItemSlots.
                                 local ok_sv, sv = pcall(function()
                                     return comp:GetPropertyValue("ItemSlots")
                                 end)
@@ -785,63 +876,82 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                                         log_err("OPI fix: json.decode failed: " .. tostring(parsed))
                                         parsed = nil
                                     end
-                                    for i = 1, SECOND_INV_SLOTS do
-                                        local ok_sl, sl = pcall(function() return sv[i] end)
-                                        if ok_sl and sl then
+                                    for key, slot_data in pairs(parsed or {}) do
+                                        local idx = tonumber(key)
+                                        if idx and type(slot_data) == "table"
+                                           and slot_data.GUID and slot_data.GUID ~= ""
+                                           and norm_guid_hex(slot_data.GUID) ~= EMPTY_GUID then
+                                            local i = idx + 1  -- sv[] is 1-based, JSON keys 0-based
+                                            local ok_sl, sl = pcall(function() return sv[i] end)
+                                            if not (ok_sl and sl) then
+                                                log_err(string.format("OPI fix: sv[%d] unavailable", i))
+                                                goto next_slot
+                                            end
+
+                                            -- 1. Resolve the item asset to a live UObject.
+                                            local item_path = slot_data.ItemData or ""
+                                            local found = nil
+                                            for _, try_path in ipairs({ item_path, item_path .. "_C" }) do
+                                                local ok_fo, fo = pcall(StaticFindObject, try_path)
+                                                if ok_fo and fo and fo:IsValid() then
+                                                    found = fo
+                                                    log("OPI fix: StaticFindObject OK: " .. try_path)
+                                                    break
+                                                end
+                                            end
+                                            if not found then
+                                                -- Asset not in memory — try LoadAsset (UE4SS ≥2.5, game thread).
+                                                local ok_la, la = pcall(function() return LoadAsset(item_path) end)
+                                                log("OPI fix: LoadAsset attempted = " .. tostring(ok_la))
+                                                if ok_la then
+                                                    local ok_fo2, fo2 = pcall(StaticFindObject, item_path)
+                                                    if ok_fo2 and fo2 and fo2:IsValid() then
+                                                        found = fo2
+                                                        log("OPI fix: StaticFindObject OK after LoadAsset")
+                                                    end
+                                                end
+                                            end
+                                            if found then
+                                                local ok_set = pcall(function()
+                                                    sl:SetPropertyValue("ItemData", found)
+                                                end)
+                                                local ok_iv2, id_valid2 = pcall(function()
+                                                    return sl:GetPropertyValue("ItemData"):IsValid()
+                                                end)
+                                                log(string.format(
+                                                    "OPI fix: slot %d ItemData set=%s valid-after=%s",
+                                                    idx, tostring(ok_set), tostring(ok_iv2 and id_valid2)))
+                                            else
+                                                log_err("OPI fix: could not resolve asset: " .. tostring(item_path))
+                                            end
+
+                                            -- 2. Write the slot GUID (hex from our save file).
                                             local ok_gv, gv = pcall(function()
                                                 return sl:GetPropertyValue("GUID")
                                             end)
                                             if ok_gv and gv then
-                                                local ok_a, a = pcall(function() return gv.A end)
-                                                local ok_b, b = pcall(function() return gv.B end)
-                                                local am = ok_a and ((tonumber(a) or 0) & 0xFFFFFFFF) or 0
-                                                local bm = ok_b and ((tonumber(b) or 0) & 0xFFFFFFFF) or 0
-                                                if am ~= 0 or bm ~= 0 then
-                                                    -- Occupied slot found.
-                                                    local ok_iv, id_valid = pcall(function()
-                                                        return sl:GetPropertyValue("ItemData"):IsValid()
-                                                    end)
-                                                    log(string.format(
-                                                        "OPI fix: sv[%d] GUID.A=%08X ItemData:IsValid()=%s",
-                                                        i, am, tostring(ok_iv and id_valid)))
-
-                                                    -- If ItemData is invalid, try to fix it via StaticFindObject.
-                                                    if not (ok_iv and id_valid) then
-                                                        local json_key = tostring(i - 1)
-                                                        local slot_data = parsed and parsed[json_key]
-                                                        local item_path = slot_data and slot_data.ItemData
-                                                        if item_path and item_path ~= "" then
-                                                            -- Try the path as-is, then with _C suffix.
-                                                            local found = nil
-                                                            for _, try_path in ipairs({item_path, item_path .. "_C"}) do
-                                                                local ok_fo, fo = pcall(function()
-                                                                    return StaticFindObject(try_path)
-                                                                end)
-                                                                if ok_fo and fo and fo:IsValid() then
-                                                                    found = fo
-                                                                    log("OPI fix: StaticFindObject OK: " .. try_path)
-                                                                    break
-                                                                end
-                                                            end
-                                                            if found then
-                                                                local ok_set = pcall(function()
-                                                                    sl:SetPropertyValue("ItemData", found)
-                                                                end)
-                                                                log("OPI fix: SetPropertyValue(ItemData) = " .. tostring(ok_set))
-                                                                -- Re-check validity.
-                                                                local ok_iv2, id_valid2 = pcall(function()
-                                                                    return sl:GetPropertyValue("ItemData"):IsValid()
-                                                                end)
-                                                                log("OPI fix: ItemData:IsValid() after set = " .. tostring(ok_iv2 and id_valid2))
-                                                            else
-                                                                log("OPI fix: StaticFindObject failed for: " .. tostring(item_path))
-                                                            end
-                                                        end
-                                                    end
-                                                end
+                                                local ok_wg, wg_detail = write_fguid(gv, slot_data.GUID)
+                                                log(string.format("OPI fix: slot %d GUID write ok=%s (%s)",
+                                                    idx, tostring(ok_wg), tostring(wg_detail)))
+                                            else
+                                                log_err(string.format("OPI fix: slot %d GUID unreadable", idx))
                                             end
+
+                                            -- 3. Write Count.
+                                            local cnt = tonumber(slot_data.Count) or 1
+                                            local ok_c = pcall(function()
+                                                sl:SetPropertyValue("Count", cnt)
+                                            end)
+                                            local ok_rc, rc = pcall(function()
+                                                return tonumber(sl:GetPropertyValue("Count"))
+                                            end)
+                                            log(string.format("OPI fix: slot %d Count=%d set=%s read-back=%s",
+                                                idx, cnt, tostring(ok_c), tostring(ok_rc and rc)))
                                         end
+                                        ::next_slot::
                                     end
+                                else
+                                    log_err("OPI fix: ItemSlots unreadable on comp")
                                 end
 
                                 -- Try OnRep_ItemSlots to nudge the UI into re-rendering.
@@ -1033,6 +1143,62 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                                                 log("REAL inv [" .. nm_str .. "] len="
                                                     .. (ok_j and j and tostring(#j) or "err")
                                                     .. " (empty/layout only)")
+                                            end
+
+                                            -- GUID-encoding spy: dump the real inventory's LIVE slots so we
+                                            -- can match hex GUIDs/asset paths against the base64url values in
+                                            -- CharacterSave.json's PersonalInventory table (offline analysis).
+                                            local ok_rs, rs = pcall(function()
+                                                return pic:GetPropertyValue("ItemSlots")
+                                            end)
+                                            if ok_rs and rs then
+                                                for ri = 1, 32 do
+                                                    local ok_rsl, rsl = pcall(function() return rs[ri] end)
+                                                    if not (ok_rsl and rsl) then break end
+                                                    local ok_rg, rg = pcall(function()
+                                                        return rsl:GetPropertyValue("GUID")
+                                                    end)
+                                                    local ghex = (ok_rg and rg) and norm_guid_hex(read_fguid(rg)) or ""
+                                                    if ghex ~= "" and ghex ~= EMPTY_GUID then
+                                                        local ok_rd, rd = pcall(function()
+                                                            return rsl:GetPropertyValue("ItemData")
+                                                        end)
+                                                        local path = "?"
+                                                        if ok_rd and rd then
+                                                            local ok_fn, fn = pcall(function() return rd:GetFullName() end)
+                                                            if ok_fn and fn then path = tostring(fn) end
+                                                        end
+                                                        local ok_rcnt, rcnt = pcall(function()
+                                                            return tonumber(rsl:GetPropertyValue("Count"))
+                                                        end)
+                                                        log(string.format("SPY real slot %d: GUID=%s Count=%s",
+                                                            ri - 1, ghex, tostring(ok_rcnt and rcnt)))
+                                                        log("SPY real slot " .. (ri - 1) .. ": ItemData=" .. path)
+                                                        -- Sweep the ItemData asset for GUID-like properties —
+                                                        -- one of them should match the b64 ItemData in the save.
+                                                        if ok_rd and rd then
+                                                            local gprops = {
+                                                                "Guid", "GUID", "ItemGuid", "AssetGuid",
+                                                                "Id", "ID", "ItemId", "ItemID",
+                                                                "UniqueId", "UniqueID", "AssetId",
+                                                                "RegistryId", "SaveId", "SaveGuid",
+                                                                "PersistentGuid", "DataGuid",
+                                                            }
+                                                            for _, gp in ipairs(gprops) do
+                                                                local ok_pv, pv = pcall(function()
+                                                                    return rd:GetPropertyValue(gp)
+                                                                end)
+                                                                if ok_pv and pv ~= nil then
+                                                                    local h = norm_guid_hex(read_fguid(pv))
+                                                                    if h ~= "" and h ~= EMPTY_GUID then
+                                                                        log("SPY real slot " .. (ri - 1)
+                                                                            .. ": ItemData." .. gp .. " = " .. h)
+                                                                    end
+                                                                end
+                                                            end
+                                                        end
+                                                    end
+                                                end
                                             end
                                         end
                                     end

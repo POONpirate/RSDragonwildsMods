@@ -1,32 +1,30 @@
 -- ============================================================
---  QuickGrow v4.4 — UE4SS Lua Mod for RS: Dragonwilds
+--  QuickGrow v4.5 — UE4SS Lua Mod for RS: Dragonwilds
 --
---  v4.3 log findings:
---   * TIME SYSTEM FOUND: BP_InGameTimeActor_C
---       RealTimeMinutesPerInGameDay = 24  (1 real s = 60 game s)
---       TimeOfDawn = 4.5, TimeOfDusk = 22.0
---       StoredTime = 272430 (game seconds), LastSyncTime (real s)
---   * CanSleep signature confirmed: CanSleep(player) -> 4 (day)
---   * Generic property dumping CRASHES on exotic property types
---     (died right after bIsTimePaused). v4.4 reads/writes only
---     known-safe numeric props by name.
+--  v4.4 crash finding:
+--   * ForEachFunction on /Script/Engine.Actor crashed natively
+--     mid-enumeration. NO reflection enumeration of any kind is
+--     safe in this game. Removed entirely.
+--   * Class chain confirmed: BP_InGameTimeActor_C
+--       -> /Script/Dominion.InGameTimeActor -> Actor
+--   * The StoredTime clock-advance strategy never got to run.
 --
---  v4.4 strategy on Oculus cast:
---   1. Try Sleep(player) — works if already night.
---   2. Else: advance InGameTimeActor.StoredTime by 1 game-hour
---      steps until CanSleep(player) == 0 (self-calibrating, no
---      unit guessing), then Sleep(player) -> day advances.
---      On total failure, StoredTime is restored.
---   3. One-time, also log the time actor's class chain and own
---      function names (BP classes enumerate fine) for fallback.
+--  v4.5 on Oculus cast:
+--   1. Night? Sleep(player) directly.
+--   2. Day? Bump InGameTimeActor.StoredTime +1 game-hour at a
+--      time (max 30) until CanSleep(player)==0, then Sleep.
+--      Restore StoredTime on failure.
+--   3. On failure only: RegisterHook name-probe (the proven
+--      PropertyDumper technique — registration only, no calls,
+--      no enumeration) on /Script/Dominion.InGameTimeActor.
 -- ============================================================
 
 local SPELL_HOOK = "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded"
 local BED_CLASS  = "BP_BaseBuilding_Bed_C"
 local TIME_CLASS = "BP_InGameTimeActor_C"
 
-local GAME_HOUR    = 3600  -- StoredTime appears to be in game-seconds
-local MAX_HOPS     = 30    -- max 1-hour bumps before giving up
+local GAME_HOUR = 3600  -- StoredTime is in game-seconds
+local MAX_HOPS  = 30    -- max 1-hour bumps before giving up
 
 -- ── Helpers ──────────────────────────────────────────────────
 local function log(msg)
@@ -40,13 +38,6 @@ end
 
 local function valid(obj)
     return obj ~= nil and try(function() return obj:IsValid() end) == true
-end
-
-local function describe(v)
-    if v == nil then return "nil" end
-    local full = try(function() return v:GetFullName() end)
-    if full then return tostring(full) end
-    return string.format("%s (%s)", tostring(v), type(v))
 end
 
 -- ── Cache ─────────────────────────────────────────────────────
@@ -118,27 +109,39 @@ local function findTimeActor()
     return nil
 end
 
--- One-time info dump: class chain + own function names.
--- (Name enumeration only — never reads property values generically,
---  which is what crashed v4.3.)
-local infoDumped = false
-local function dumpTimeActorInfo(timeActor)
-    if infoDumped then return end
-    infoDumped = true
-    log("Time actor class chain & functions:")
-    local cls = try(function() return timeActor:GetClass() end)
-    local depth = 0
-    while cls ~= nil and depth < 8 do
-        log("  CLASS: " .. (try(function() return cls:GetFullName() end) or "?"))
-        pcall(function()
-            cls:ForEachFunction(function(fn)
-                local fname = try(function() return fn:GetFName():ToString() end)
-                if fname then log("    fn: " .. fname) end
-            end)
+-- ── Fallback: safe RegisterHook name probe (no enumeration) ──
+local probed = false
+local function probeTimeActorFunctions()
+    if probed then return end
+    probed = true
+    log("Probing /Script/Dominion.InGameTimeActor functions (safe, registration only):")
+    local names = {
+        "GetInGameTime", "SetInGameTime", "GetTime", "SetTime",
+        "GetTimeOfDay", "SetTimeOfDay", "GetCurrentTimeOfDay",
+        "GetNormalizedTimeOfDay", "SetNormalizedTimeOfDay",
+        "AddTime", "AdvanceTime", "SkipTime", "SkipToTime",
+        "SkipNight", "SkipToMorning", "SkipToDay", "SkipToDawn",
+        "AdvanceToMorning", "StartNewDay", "StartNextDay",
+        "SetStoredTime", "GetStoredTime", "SyncTime", "ForceTimeSync",
+        "GetCurrentDay", "GetDayNumber", "GetDayCount",
+        "IsNight", "IsNightTime", "IsDayTime", "IsDay",
+        "PauseTime", "UnpauseTime", "SetTimePaused", "SetIsTimePaused",
+        "OnTimeChanged", "OnDayChanged", "OnNewDay", "OnTimeOfDayChanged",
+        "ServerSetTime", "ServerSetTimeOfDay", "MulticastSetTime",
+        "OnRep_StoredTime", "GetTimeOfDawn", "GetTimeOfDusk",
+    }
+    local hits = 0
+    for _, fname in ipairs(names) do
+        local path = "/Script/Dominion.InGameTimeActor:" .. fname
+        local ok, res = pcall(function()
+            return RegisterHook(path, function() end, function() end)
         end)
-        cls = try(function() return cls:GetSuperStruct() end)
-        depth = depth + 1
+        if ok and res ~= nil then
+            log("  FN HIT: " .. fname)
+            hits = hits + 1
+        end
     end
+    log(string.format("Probe done: %d hit(s). Send UE4SS.log back.", hits))
 end
 
 -- ── Day-advance core ─────────────────────────────────────────
@@ -191,11 +194,10 @@ local function advanceWorldDay()
         return false
     end
 
-    dumpTimeActorInfo(timeActor)
-
     local original = try(function() return timeActor.StoredTime end)
     if type(original) ~= "number" then
         log("WARNING: StoredTime not readable (got " .. tostring(original) .. ").")
+        probeTimeActorFunctions()
         return false
     end
 
@@ -230,9 +232,9 @@ local function advanceWorldDay()
     -- Failure: restore the clock so we don't leave time corrupted.
     pcall(function() timeActor.StoredTime = original end)
     log(string.format(
-        "FAILED after %d hops (CanSleep=%s). StoredTime restored to %.0f. " ..
-        "Send UE4SS.log back (function list above is the fallback plan).",
+        "FAILED after %d hops (CanSleep=%s). StoredTime restored to %.0f.",
         hops, tostring(canSleep()), original))
+    probeTimeActorFunctions()
     return false
 end
 
@@ -273,11 +275,11 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
         if ok_main then
             hook_registered = true
-            log("v4.4 ready.")
+            log("v4.5 ready.")
         else
             log("ERROR registering Oculus hook: " .. tostring(err_main))
         end
     end)
 end)
 
-print("[QuickGrow] v4.4 loaded.\n")
+print("[QuickGrow] v4.5 loaded.\n")

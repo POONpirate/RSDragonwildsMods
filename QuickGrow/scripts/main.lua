@@ -1,30 +1,33 @@
 -- ============================================================
---  QuickGrow v4.5 — UE4SS Lua Mod for RS: Dragonwilds
+--  QuickGrow v4.6 — UE4SS Lua Mod for RS: Dragonwilds
 --
---  v4.4 crash finding:
---   * ForEachFunction on /Script/Engine.Actor crashed natively
---     mid-enumeration. NO reflection enumeration of any kind is
---     safe in this game. Removed entirely.
---   * Class chain confirmed: BP_InGameTimeActor_C
---       -> /Script/Dominion.InGameTimeActor -> Actor
---   * The StoredTime clock-advance strategy never got to run.
+--  v4.5 findings:
+--   * NIGHT cast WORKS: Sleep(player) -> sleep + day advance.
+--   * DAY cast: 30x StoredTime bumps never changed CanSleep
+--     (3 or 4). Either the write doesn't stick or CanSleep reads
+--     time elsewhere. Also: 0/45 name hits on native
+--     /Script/Dominion.InGameTimeActor.
+--   * CanSleep codes seen: 0=ok, 3=? (maybe too-early), 4=not night.
 --
---  v4.5 on Oculus cast:
---   1. Night? Sleep(player) directly.
---   2. Day? Bump InGameTimeActor.StoredTime +1 game-hour at a
---      time (max 30) until CanSleep(player)==0, then Sleep.
---      Restore StoredTime on failure.
---   3. On failure only: RegisterHook name-probe (the proven
---      PropertyDumper technique — registration only, no calls,
---      no enumeration) on /Script/Dominion.InGameTimeActor.
+--  v4.6:
+--   * Registers throttled OBSERVERS at startup across the time
+--     actor (BP + native), DominionGameMode and DominionGameState
+--     (~60 candidate names each, RegisterHook probe — safe).
+--     A working NIGHT cast will reveal the real day-advance call.
+--   * Day cast: verifies whether the StoredTime write actually
+--     sticks (read-back logging), then runs the hop loop.
+--
+--  TEST: cast once at night (works; captures the call chain),
+--  once during day, then send UE4SS.log back.
 -- ============================================================
 
 local SPELL_HOOK = "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded"
 local BED_CLASS  = "BP_BaseBuilding_Bed_C"
 local TIME_CLASS = "BP_InGameTimeActor_C"
 
-local GAME_HOUR = 3600  -- StoredTime is in game-seconds
-local MAX_HOPS  = 30    -- max 1-hour bumps before giving up
+local GAME_HOUR = 3600
+local MAX_HOPS  = 30
+local OBS_LIMIT = 5     -- max logged calls per observed function
 
 -- ── Helpers ──────────────────────────────────────────────────
 local function log(msg)
@@ -38,6 +41,15 @@ end
 
 local function valid(obj)
     return obj ~= nil and try(function() return obj:IsValid() end) == true
+end
+
+local function describe(v)
+    if v == nil then return "nil" end
+    local t = type(v)
+    if t == "number" or t == "boolean" or t == "string" then return tostring(v) end
+    local full = try(function() return v:GetFullName() end)
+    if full then return tostring(full) end
+    return string.format("%s (%s)", tostring(v), t)
 end
 
 -- ── Cache ─────────────────────────────────────────────────────
@@ -109,39 +121,86 @@ local function findTimeActor()
     return nil
 end
 
--- ── Fallback: safe RegisterHook name probe (no enumeration) ──
+-- ── Probe + observe (safe RegisterHook technique) ────────────
+local obsCounts = {}
+
+local function registerProbeObserver(path)
+    local ok, res = pcall(function()
+        return RegisterHook(path,
+            function(self, ...)
+                local c = (obsCounts[path] or 0) + 1
+                obsCounts[path] = c
+                if c > OBS_LIMIT then return end
+                local n = select("#", ...)
+                local parts = {}
+                for i = 1, n do
+                    local p = select(i, ...)
+                    parts[#parts + 1] = describe(try(function() return p:get() end))
+                end
+                log(string.format("OBSERVE %s (%s)", path,
+                    n > 0 and table.concat(parts, ", ") or ""))
+            end,
+            function() end)
+    end)
+    return ok and res ~= nil
+end
+
+local CANDIDATE_NAMES = {
+    -- sleep flow (GameMode/GameState side)
+    "OnAllPlayersSleeping", "AllPlayersSleeping", "HandleAllPlayersSleeping",
+    "OnPlayerSleepStateChanged", "PlayerSleepStateChanged",
+    "NotifyPlayerSleeping", "RegisterSleepingPlayer", "UnregisterSleepingPlayer",
+    "GetNumSleepingPlayers", "AreAllPlayersSleeping", "CheckAllPlayersSleeping",
+    "WakeAllPlayers", "WakeUpAllPlayers",
+    -- day advance
+    "SkipNight", "SkipToMorning", "AdvanceToMorning", "AdvanceDay",
+    "StartNewDay", "StartNextDay", "BeginNewDay",
+    "OnDayStarted", "OnNightStarted", "OnMorning", "OnNewDay", "OnDayChanged",
+    -- time set/advance
+    "SetTimeOfDay", "SetTime", "SetInGameTime", "SetCurrentTime",
+    "SetTimeOfDayNormalized", "SetNormalizedTimeOfDay",
+    "AddTime", "AddHours", "AdvanceTime", "SkipTime", "SkipToTime",
+    "SetStoredTime", "SyncTime", "UpdateStoredTime", "UpdateTime",
+    "OnRep_StoredTime",
+    -- time get/query
+    "GetTimeOfDay", "GetCurrentTimeOfDay", "GetInGameTime", "GetCurrentTime",
+    "GetNormalizedTimeOfDay", "GetTimeOfDayHours",
+    "GetCurrentDay", "GetDayNumber", "GetDayCount",
+    "IsNight", "IsNightTime", "IsDayTime",
+    "GetTimeOfDawn", "GetTimeOfDusk",
+    -- pause / events
+    "SetTimePaused", "SetIsTimePaused", "PauseTime", "ResumeTime",
+    "OnTimeOfDayChanged", "OnTimeChanged", "TimeOfDayUpdated",
+    -- RPC variants
+    "ServerSetTimeOfDay", "ServerSkipNight", "ServerSetTime",
+    "MulticastSetTime", "MulticastSetTimeOfDay",
+}
+
+local CANDIDATE_CLASSES = {
+    "/Script/Dominion.InGameTimeActor",
+    "/Game/Gameplay/World/Time/BP_InGameTimeActor.BP_InGameTimeActor_C",
+    "/Script/Dominion.DominionGameMode",
+    "/Script/Dominion.DominionGameState",
+}
+
 local probed = false
-local function probeTimeActorFunctions()
+local function probeAndObserveAll()
     if probed then return end
     probed = true
-    log("Probing /Script/Dominion.InGameTimeActor functions (safe, registration only):")
-    local names = {
-        "GetInGameTime", "SetInGameTime", "GetTime", "SetTime",
-        "GetTimeOfDay", "SetTimeOfDay", "GetCurrentTimeOfDay",
-        "GetNormalizedTimeOfDay", "SetNormalizedTimeOfDay",
-        "AddTime", "AdvanceTime", "SkipTime", "SkipToTime",
-        "SkipNight", "SkipToMorning", "SkipToDay", "SkipToDawn",
-        "AdvanceToMorning", "StartNewDay", "StartNextDay",
-        "SetStoredTime", "GetStoredTime", "SyncTime", "ForceTimeSync",
-        "GetCurrentDay", "GetDayNumber", "GetDayCount",
-        "IsNight", "IsNightTime", "IsDayTime", "IsDay",
-        "PauseTime", "UnpauseTime", "SetTimePaused", "SetIsTimePaused",
-        "OnTimeChanged", "OnDayChanged", "OnNewDay", "OnTimeOfDayChanged",
-        "ServerSetTime", "ServerSetTimeOfDay", "MulticastSetTime",
-        "OnRep_StoredTime", "GetTimeOfDawn", "GetTimeOfDusk",
-    }
-    local hits = 0
-    for _, fname in ipairs(names) do
-        local path = "/Script/Dominion.InGameTimeActor:" .. fname
-        local ok, res = pcall(function()
-            return RegisterHook(path, function() end, function() end)
-        end)
-        if ok and res ~= nil then
-            log("  FN HIT: " .. fname)
-            hits = hits + 1
+    local total = 0
+    for _, cp in ipairs(CANDIDATE_CLASSES) do
+        local hits = {}
+        for _, fname in ipairs(CANDIDATE_NAMES) do
+            if registerProbeObserver(cp .. ":" .. fname) then
+                hits[#hits + 1] = fname
+                total = total + 1
+            end
+        end
+        if #hits > 0 then
+            log("PROBE HITS on " .. cp .. ": " .. table.concat(hits, ", "))
         end
     end
-    log(string.format("Probe done: %d hit(s). Send UE4SS.log back.", hits))
+    log(string.format("Probe/observe registered: %d function(s) total.", total))
 end
 
 -- ── Day-advance core ─────────────────────────────────────────
@@ -187,7 +246,7 @@ local function advanceWorldDay()
         end
     end
 
-    -- 2. Daytime: advance the in-game clock until night.
+    -- 2. Daytime: try advancing the in-game clock.
     local timeActor = findTimeActor()
     if not valid(timeActor) then
         log("WARNING: " .. TIME_CLASS .. " not found.")
@@ -197,44 +256,47 @@ local function advanceWorldDay()
     local original = try(function() return timeActor.StoredTime end)
     if type(original) ~= "number" then
         log("WARNING: StoredTime not readable (got " .. tostring(original) .. ").")
-        probeTimeActorFunctions()
         return false
     end
 
     log(string.format("Daytime (CanSleep=%s). StoredTime=%.0f — advancing clock...",
         tostring(canSleep()), original))
 
-    local hops = 0
+    -- Write verification: does the property write actually stick?
+    pcall(function() timeActor.StoredTime = original + GAME_HOUR end)
+    local readBack = try(function() return timeActor.StoredTime end)
+    log(string.format("Write check: wrote %.0f, read back %s — %s",
+        original + GAME_HOUR, tostring(readBack),
+        (readBack == original + GAME_HOUR) and "WRITE STICKS" or "WRITE IGNORED"))
+
+    local hops = 1
     local slept = false
     while hops < MAX_HOPS do
         hops = hops + 1
-        local okSet = pcall(function()
+        pcall(function()
             timeActor.StoredTime = timeActor.StoredTime + GAME_HOUR
         end)
-        if not okSet then
-            log("WARNING: writing StoredTime failed.")
-            break
-        end
         local cs = canSleep()
         if cs == 0 then
-            log(string.format("Night reached after +%d game-hour(s) (StoredTime=%.0f).",
-                hops, try(function() return timeActor.StoredTime end) or -1))
+            log(string.format("Night reached after +%d game-hour(s).", hops))
             slept = trySleep()
             break
+        end
+        if hops % 10 == 0 then
+            log(string.format("  hop %d: StoredTime=%s CanSleep=%s",
+                hops, tostring(try(function() return timeActor.StoredTime end)),
+                tostring(cs)))
         end
     end
 
     if slept then
-        log("SUCCESS: clock advanced to night, Sleep(player) accepted — day should advance.")
+        log("SUCCESS: clock advanced to night, Sleep accepted.")
         return true
     end
 
-    -- Failure: restore the clock so we don't leave time corrupted.
     pcall(function() timeActor.StoredTime = original end)
-    log(string.format(
-        "FAILED after %d hops (CanSleep=%s). StoredTime restored to %.0f.",
-        hops, tostring(canSleep()), original))
-    probeTimeActorFunctions()
+    log(string.format("FAILED after %d hops (CanSleep=%s). StoredTime restored.",
+        hops, tostring(canSleep())))
     return false
 end
 
@@ -266,6 +328,8 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
             )
         end)
 
+        probeAndObserveAll()
+
         local ok_main, err_main = pcall(function()
             RegisterHook(SPELL_HOOK,
                 function(self, Instance) onOculusCast() end,
@@ -275,11 +339,11 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
         if ok_main then
             hook_registered = true
-            log("v4.5 ready.")
+            log("v4.6 ready.")
         else
             log("ERROR registering Oculus hook: " .. tostring(err_main))
         end
     end)
 end)
 
-print("[QuickGrow] v4.5 loaded.\n")
+print("[QuickGrow] v4.6 loaded.\n")

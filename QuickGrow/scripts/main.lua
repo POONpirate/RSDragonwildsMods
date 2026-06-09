@@ -1,13 +1,11 @@
 -- ============================================================
---  QuickGrow v3 — UE4SS Lua Mod for RuneScape: Dragonwilds
+--  QuickGrow v4.1 — UE4SS Lua Mod for RuneScape: Dragonwilds
 --
 --  When the Eye of Oculus is cast:
---    1. Suppresses the build menu (DeactivateOculus)
---    2. Finds the player's claimed bed (BP_BaseBuilding_Bed_C)
---    3. Calls ToggleRestingOrSleeping(player, controller) on it —
---       the same function the normal bed-interaction path calls.
---       This runs the full BedComponent sleep flow, triggering
---       OnAllPlayersSleeping on the GameMode → day advance → OnFullyRested.
+--    1. Suppress the build menu (DeactivateOculus)
+--    2. Find the player's claimed bed (BP_BaseBuilding_Bed_C)
+--    3. Call BedComponent:Sleep(player) directly — bypasses the
+--       CanSleep time-of-day check, advancing the day at any time.
 -- ============================================================
 
 local DEBUG = false
@@ -30,10 +28,7 @@ local function valid(obj)
 end
 
 -- ── Cache ─────────────────────────────────────────────────────
-local cache = {
-    ctrl   = nil,
-    player = nil,
-}
+local cache = { ctrl = nil, player = nil }
 
 local function refreshCache()
     if not valid(cache.ctrl) then
@@ -57,16 +52,13 @@ local function refreshCache()
 end
 
 -- ── Bed finder ────────────────────────────────────────────────
--- Returns the bed claimed by the local player, or any valid bed as fallback.
 local function findPlayerBed()
     local beds = FindAllOf(BED_CLASS)
     if not beds then return nil end
-
     local anyBed = nil
     for _, bed in ipairs(beds) do
         if valid(bed) then
             anyBed = anyBed or bed
-            -- Prefer the bed claimed by this player
             local claimed = try(function()
                 local bedComp = bed.Bed
                 if valid(bedComp) then
@@ -74,69 +66,49 @@ local function findPlayerBed()
                 end
                 return false
             end)
-            if claimed then
-                dbg("Found claimed bed.")
-                return bed
-            end
+            if claimed then return bed end
         end
-    end
-
-    if anyBed then
-        dbg("No claimed bed found — using first available bed.")
     end
     return anyBed
 end
 
--- ── Day-advance via bed ───────────────────────────────────────
+-- ── Day-advance via BedComponent:Sleep ───────────────────────
 local function advanceWorldDay()
-    if not valid(cache.player) or not valid(cache.ctrl) then
-        print("[QuickGrow] WARNING: Player or controller not ready.\n")
+    if not valid(cache.player) then
+        print("[QuickGrow] WARNING: Player not ready.\n")
         return false
     end
 
     local bed = findPlayerBed()
     if not bed then
-        print("[QuickGrow] WARNING: No bed found in world. Build and claim a bed first.\n")
+        print("[QuickGrow] WARNING: No bed found. Build and claim a bed first.\n")
         return false
     end
 
-    -- Call ToggleRestingOrSleeping — same entry point as physical bed interaction.
-    -- Parameters: Player Character (DominionPlayerCharacter), Player Controller (DominionPlayerController)
-    -- Out param:  StartedRestingOrSleeping (bool) — true if sleep/rest began
-    -- ToggleRestingOrSleeping has 3 UFunction params:
-    --   Player Character, Player Controller, StartedRestingOrSleeping (OutParm bool)
-    -- UE4SS requires out params to be passed as a Lua table, which gets filled on return.
-    local outParams = {}
+    local bedComp = try(function() return bed.Bed end)
+    if not valid(bedComp) then
+        print("[QuickGrow] WARNING: BedComponent is nil.\n")
+        return false
+    end
+
     local ok, err = pcall(function()
-        bed:ToggleRestingOrSleeping(cache.player, cache.ctrl, outParams)
+        bedComp:Sleep(cache.player)
     end)
 
-    if ok then
-        local started = outParams.StartedRestingOrSleeping
-        print(string.format("[QuickGrow] ToggleRestingOrSleeping called. StartedRestingOrSleeping=%s\n",
-            tostring(started)))
-        return true
-    else
-        print(string.format("[QuickGrow] ERROR calling ToggleRestingOrSleeping: %s\n",
-            tostring(err)))
+    if not ok then
+        print(string.format("[QuickGrow] ERROR: %s\n", tostring(err)))
         return false
     end
+
+    return true
 end
 
 -- ── Cast handler ──────────────────────────────────────────────
 local function onOculusCast()
     ExecuteInGameThread(function()
         refreshCache()
-
-        if not valid(cache.player) then
-            dbg("Player not ready — skipping cast")
-            return
-        end
-
-        local ok = advanceWorldDay()
-        if ok then
-            print("[QuickGrow] Day advance triggered via Eye of Oculus.\n")
-        end
+        if not valid(cache.player) then dbg("Player not ready"); return end
+        advanceWorldDay()
     end)
 end
 
@@ -145,44 +117,35 @@ local hook_registered = false
 
 NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
     if hook_registered then return end
-
     ExecuteInGameThread(function()
         if hook_registered then return end
 
-        -- Suppress the Oculus build menu.
-        local ok_deact = pcall(function()
+        pcall(function()
             RegisterHook("/Script/Dominion.OculusComponent:ActivateOculus",
                 function(self) end,
                 function(self)
-                    local ok_get, comp = pcall(function() return self:get() end)
-                    if not ok_get or not comp then return end
+                    local ok, comp = pcall(function() return self:get() end)
+                    if not ok or not comp then return end
                     pcall(function() comp:DeactivateOculus() end)
-                    dbg("Build menu suppressed via DeactivateOculus.")
+                    dbg("Build menu suppressed.")
                 end
             )
         end)
-        if not ok_deact then
-            print("[QuickGrow] WARNING: Could not hook ActivateOculus — build menu may still open.\n")
-        end
 
-        -- Main Eye of Oculus cast hook.
         local ok_main, err_main = pcall(function()
             RegisterHook(SPELL_HOOK,
-                function(self, Instance)
-                    onOculusCast()
-                end,
+                function(self, Instance) onOculusCast() end,
                 function(self, Instance) end
             )
         end)
 
-        if not ok_main then
-            print(string.format("[QuickGrow] ERROR: Failed to register Oculus hook: %s\n",
-                tostring(err_main)))
-        else
+        if ok_main then
             hook_registered = true
-            print("[QuickGrow] Ready. Cast Eye of Oculus to skip to morning.\n")
+            dbg("Ready.")
+        else
+            print(string.format("[QuickGrow] ERROR registering Oculus hook: %s\n", tostring(err_main)))
         end
     end)
 end)
 
-print("[QuickGrow] v3.0 loaded. Make sure you have a bed built and claimed.\n")
+print("[QuickGrow] v4.1 loaded.\n")

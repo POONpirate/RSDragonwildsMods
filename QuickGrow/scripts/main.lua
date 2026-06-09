@@ -1,24 +1,21 @@
 -- ============================================================
---  QuickGrow v4.6 — UE4SS Lua Mod for RS: Dragonwilds
+--  QuickGrow v4.7 — UE4SS Lua Mod for RS: Dragonwilds
 --
---  v4.5 findings:
---   * NIGHT cast WORKS: Sleep(player) -> sleep + day advance.
---   * DAY cast: 30x StoredTime bumps never changed CanSleep
---     (3 or 4). Either the write doesn't stick or CanSleep reads
---     time elsewhere. Also: 0/45 name hits on native
---     /Script/Dominion.InGameTimeActor.
---   * CanSleep codes seen: 0=ok, 3=? (maybe too-early), 4=not night.
+--  v4.6 findings:
+--   * StoredTime writes STICK (read-back confirmed) but CanSleep
+--     ignores them entirely -> StoredTime is not the live clock.
+--   * 0/65 candidate names exist on InGameTimeActor (native+BP),
+--     DominionGameMode, DominionGameState. Name-guessing is done.
 --
---  v4.6:
---   * Registers throttled OBSERVERS at startup across the time
---     actor (BP + native), DominionGameMode and DominionGameState
---     (~60 candidate names each, RegisterHook probe — safe).
---     A working NIGHT cast will reveal the real day-advance call.
---   * Day cast: verifies whether the StoredTime write actually
---     sticks (read-back logging), then runs the hop loop.
---
---  TEST: cast once at night (works; captures the call chain),
---  once during day, then send UE4SS.log back.
+--  v4.7 on a daytime cast:
+--   1. List ALL BP_InGameTimeActor_C instances (maybe we wrote to
+--      the wrong one / a CDO) and their StoredTime values.
+--   2. SAFE property map of time actor + GameMode + GameState:
+--      pass 1 = names + types only (no value reads at all);
+--      pass 2 = values for numeric/bool/enum types ONLY.
+--      (v4.3 crashed reading exotic property values blindly.)
+--   3. Hop loop now writes StoredTime on ALL instances.
+--  Night cast unchanged: Sleep(player) works.
 -- ============================================================
 
 local SPELL_HOOK = "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded"
@@ -27,7 +24,6 @@ local TIME_CLASS = "BP_InGameTimeActor_C"
 
 local GAME_HOUR = 3600
 local MAX_HOPS  = 30
-local OBS_LIMIT = 5     -- max logged calls per observed function
 
 -- ── Helpers ──────────────────────────────────────────────────
 local function log(msg)
@@ -110,97 +106,86 @@ local function isSleepingNow(restComp)
     return v == true
 end
 
--- ── Time actor ────────────────────────────────────────────────
-local function findTimeActor()
+-- ── Time actors (ALL instances) ──────────────────────────────
+local function findTimeActors()
+    local out = {}
     local actors = FindAllOf(TIME_CLASS)
     if actors then
         for _, a in ipairs(actors) do
-            if valid(a) then return a end
+            if valid(a) then out[#out + 1] = a end
         end
     end
-    return nil
+    return out
 end
 
--- ── Probe + observe (safe RegisterHook technique) ────────────
-local obsCounts = {}
-
-local function registerProbeObserver(path)
-    local ok, res = pcall(function()
-        return RegisterHook(path,
-            function(self, ...)
-                local c = (obsCounts[path] or 0) + 1
-                obsCounts[path] = c
-                if c > OBS_LIMIT then return end
-                local n = select("#", ...)
-                local parts = {}
-                for i = 1, n do
-                    local p = select(i, ...)
-                    parts[#parts + 1] = describe(try(function() return p:get() end))
-                end
-                log(string.format("OBSERVE %s (%s)", path,
-                    n > 0 and table.concat(parts, ", ") or ""))
-            end,
-            function() end)
-    end)
-    return ok and res ~= nil
-end
-
-local CANDIDATE_NAMES = {
-    -- sleep flow (GameMode/GameState side)
-    "OnAllPlayersSleeping", "AllPlayersSleeping", "HandleAllPlayersSleeping",
-    "OnPlayerSleepStateChanged", "PlayerSleepStateChanged",
-    "NotifyPlayerSleeping", "RegisterSleepingPlayer", "UnregisterSleepingPlayer",
-    "GetNumSleepingPlayers", "AreAllPlayersSleeping", "CheckAllPlayersSleeping",
-    "WakeAllPlayers", "WakeUpAllPlayers",
-    -- day advance
-    "SkipNight", "SkipToMorning", "AdvanceToMorning", "AdvanceDay",
-    "StartNewDay", "StartNextDay", "BeginNewDay",
-    "OnDayStarted", "OnNightStarted", "OnMorning", "OnNewDay", "OnDayChanged",
-    -- time set/advance
-    "SetTimeOfDay", "SetTime", "SetInGameTime", "SetCurrentTime",
-    "SetTimeOfDayNormalized", "SetNormalizedTimeOfDay",
-    "AddTime", "AddHours", "AdvanceTime", "SkipTime", "SkipToTime",
-    "SetStoredTime", "SyncTime", "UpdateStoredTime", "UpdateTime",
-    "OnRep_StoredTime",
-    -- time get/query
-    "GetTimeOfDay", "GetCurrentTimeOfDay", "GetInGameTime", "GetCurrentTime",
-    "GetNormalizedTimeOfDay", "GetTimeOfDayHours",
-    "GetCurrentDay", "GetDayNumber", "GetDayCount",
-    "IsNight", "IsNightTime", "IsDayTime",
-    "GetTimeOfDawn", "GetTimeOfDusk",
-    -- pause / events
-    "SetTimePaused", "SetIsTimePaused", "PauseTime", "ResumeTime",
-    "OnTimeOfDayChanged", "OnTimeChanged", "TimeOfDayUpdated",
-    -- RPC variants
-    "ServerSetTimeOfDay", "ServerSkipNight", "ServerSetTime",
-    "MulticastSetTime", "MulticastSetTimeOfDay",
+-- ── Safe property mapping ────────────────────────────────────
+-- Pass 1: names + types only. Pass 2: values for safe types only.
+local SAFE_VALUE_TYPES = {
+    FloatProperty = true, DoubleProperty = true,
+    IntProperty = true, Int64Property = true, Int16Property = true,
+    UInt32Property = true, UInt64Property = true, UInt16Property = true,
+    BoolProperty = true, ByteProperty = true, EnumProperty = true,
+    NameProperty = true, StrProperty = true,
 }
 
-local CANDIDATE_CLASSES = {
-    "/Script/Dominion.InGameTimeActor",
-    "/Game/Gameplay/World/Time/BP_InGameTimeActor.BP_InGameTimeActor_C",
-    "/Script/Dominion.DominionGameMode",
-    "/Script/Dominion.DominionGameState",
-}
+local function mapProps(obj, label, stopAtEngine)
+    local cls = try(function() return obj:GetClass() end)
+    local depth = 0
+    while cls ~= nil and depth < 8 do
+        local cname = try(function() return cls:GetFullName() end) or "?"
+        if stopAtEngine and string.find(cname, "/Script/Engine.") then break end
+        log("  [" .. label .. "] class: " .. cname)
 
-local probed = false
-local function probeAndObserveAll()
-    if probed then return end
-    probed = true
-    local total = 0
-    for _, cp in ipairs(CANDIDATE_CLASSES) do
-        local hits = {}
-        for _, fname in ipairs(CANDIDATE_NAMES) do
-            if registerProbeObserver(cp .. ":" .. fname) then
-                hits[#hits + 1] = fname
-                total = total + 1
+        -- Pass 1: collect names + types, NO value reads
+        local props = {}
+        pcall(function()
+            cls:ForEachProperty(function(prop)
+                local pname = try(function() return prop:GetFName():ToString() end) or "?"
+                local ptype = try(function() return prop:GetClass():GetFName():ToString() end) or "?"
+                props[#props + 1] = { name = pname, ptype = ptype }
+            end)
+        end)
+        for _, p in ipairs(props) do
+            log(string.format("    %s : %s", p.name, p.ptype))
+        end
+
+        -- Pass 2: values for safe types only (names are already logged
+        -- above, so even a crash here costs us nothing)
+        for _, p in ipairs(props) do
+            if SAFE_VALUE_TYPES[p.ptype] then
+                local val = try(function() return obj[p.name] end)
+                log(string.format("    %s = %s", p.name, describe(val)))
             end
         end
-        if #hits > 0 then
-            log("PROBE HITS on " .. cp .. ": " .. table.concat(hits, ", "))
+
+        cls = try(function() return cls:GetSuperStruct() end)
+        depth = depth + 1
+    end
+end
+
+local mapped = false
+local function mapEverything(timeActors)
+    if mapped then return end
+    mapped = true
+    log("=== SAFE PROPERTY MAP ===")
+    for i, ta in ipairs(timeActors) do
+        log(string.format("TimeActor %d: %s", i,
+            try(function() return ta:GetFullName() end) or "?"))
+    end
+    if timeActors[1] then mapProps(timeActors[1], "TimeActor", true) end
+    for _, gname in ipairs({ "DominionGameState", "DominionGameMode" }) do
+        local objs = FindAllOf(gname)
+        if objs then
+            for _, o in ipairs(objs) do
+                if valid(o) then
+                    log(gname .. ": " .. (try(function() return o:GetFullName() end) or "?"))
+                    mapProps(o, gname, true)
+                    break
+                end
+            end
         end
     end
-    log(string.format("Probe/observe registered: %d function(s) total.", total))
+    log("=== MAP COMPLETE — send UE4SS.log back ===")
 end
 
 -- ── Day-advance core ─────────────────────────────────────────
@@ -246,46 +231,42 @@ local function advanceWorldDay()
         end
     end
 
-    -- 2. Daytime: try advancing the in-game clock.
-    local timeActor = findTimeActor()
-    if not valid(timeActor) then
-        log("WARNING: " .. TIME_CLASS .. " not found.")
+    -- 2. Daytime.
+    local timeActors = findTimeActors()
+    if #timeActors == 0 then
+        log("WARNING: no " .. TIME_CLASS .. " instances found.")
         return false
     end
 
-    local original = try(function() return timeActor.StoredTime end)
-    if type(original) ~= "number" then
-        log("WARNING: StoredTime not readable (got " .. tostring(original) .. ").")
-        return false
+    log(string.format("Daytime (CanSleep=%s). %d time-actor instance(s).",
+        tostring(canSleep()), #timeActors))
+    for i, ta in ipairs(timeActors) do
+        log(string.format("  [%d] StoredTime=%s  %s", i,
+            tostring(try(function() return ta.StoredTime end)),
+            try(function() return ta:GetFullName() end) or "?"))
     end
 
-    log(string.format("Daytime (CanSleep=%s). StoredTime=%.0f — advancing clock...",
-        tostring(canSleep()), original))
+    -- Safe one-time property map (the real intel for v5)
+    mapEverything(timeActors)
 
-    -- Write verification: does the property write actually stick?
-    pcall(function() timeActor.StoredTime = original + GAME_HOUR end)
-    local readBack = try(function() return timeActor.StoredTime end)
-    log(string.format("Write check: wrote %.0f, read back %s — %s",
-        original + GAME_HOUR, tostring(readBack),
-        (readBack == original + GAME_HOUR) and "WRITE STICKS" or "WRITE IGNORED"))
+    -- Hop loop across ALL instances
+    local originals = {}
+    for i, ta in ipairs(timeActors) do
+        originals[i] = try(function() return ta.StoredTime end)
+    end
 
-    local hops = 1
+    local hops = 0
     local slept = false
     while hops < MAX_HOPS do
         hops = hops + 1
-        pcall(function()
-            timeActor.StoredTime = timeActor.StoredTime + GAME_HOUR
-        end)
+        for _, ta in ipairs(timeActors) do
+            pcall(function() ta.StoredTime = ta.StoredTime + GAME_HOUR end)
+        end
         local cs = canSleep()
         if cs == 0 then
-            log(string.format("Night reached after +%d game-hour(s).", hops))
+            log(string.format("Night reached after +%d game-hour(s) (all instances).", hops))
             slept = trySleep()
             break
-        end
-        if hops % 10 == 0 then
-            log(string.format("  hop %d: StoredTime=%s CanSleep=%s",
-                hops, tostring(try(function() return timeActor.StoredTime end)),
-                tostring(cs)))
         end
     end
 
@@ -294,8 +275,12 @@ local function advanceWorldDay()
         return true
     end
 
-    pcall(function() timeActor.StoredTime = original end)
-    log(string.format("FAILED after %d hops (CanSleep=%s). StoredTime restored.",
+    for i, ta in ipairs(timeActors) do
+        if type(originals[i]) == "number" then
+            pcall(function() ta.StoredTime = originals[i] end)
+        end
+    end
+    log(string.format("FAILED after %d hops (CanSleep=%s). All StoredTimes restored.",
         hops, tostring(canSleep())))
     return false
 end
@@ -328,8 +313,6 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
             )
         end)
 
-        probeAndObserveAll()
-
         local ok_main, err_main = pcall(function()
             RegisterHook(SPELL_HOOK,
                 function(self, Instance) onOculusCast() end,
@@ -339,11 +322,11 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
         if ok_main then
             hook_registered = true
-            log("v4.6 ready.")
+            log("v4.7 ready.")
         else
             log("ERROR registering Oculus hook: " .. tostring(err_main))
         end
     end)
 end)
 
-print("[QuickGrow] v4.6 loaded.\n")
+print("[QuickGrow] v4.7 loaded.\n")

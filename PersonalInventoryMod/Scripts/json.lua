@@ -89,6 +89,10 @@ end
 local space_chars   = create_set(" ", "\t", "\r", "\n")
 local delim_chars   = create_set(" ", "\t", "\r", "\n", "]", "}", ",")
 local escape_chars  = create_set("\\", "/", '"', "b", "f", "n", "r", "t", "u")
+-- NOTE: presence must be checked via literal_set, NOT the value table —
+-- literals["false"] is false and literals["null"] is nil, so `not literals[s]`
+-- would wrongly reject valid "false"/"null" tokens.
+local literal_set   = create_set("true", "false", "null")
 local literals      = { ["true"] = true, ["false"] = false, ["null"] = nil }
 
 local function next_char(str, idx, set, negate)
@@ -167,7 +171,7 @@ end
 
 local function parse_literal(str, i)
     local s = str:match("^[a-z]+", i)
-    if not literals[s] then decode_error(str, i, "invalid literal '" .. s .. "'") end
+    if not literal_set[s] then decode_error(str, i, "invalid literal '" .. tostring(s) .. "'") end
     return literals[s], i + #s
 end
 

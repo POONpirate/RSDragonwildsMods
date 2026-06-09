@@ -71,12 +71,27 @@ local PendingRestoreData  = {}  -- guid → json string; consumed by OPI post-ho
 -- Logging helpers
 -- -----------------------------------------------------------------------------
 
+-- Parallel mod log file with immediate flush. UE4SS buffers print() output,
+-- so UE4SS.log copied while the game is running can be truncated mid-write.
+-- This file is always complete and safe to copy at any time.
+local MOD_LOG_PATH = "ue4ss/Mods/" .. MOD_NAME .. "/" .. MOD_NAME .. ".log"
+local mod_log_file = io.open(MOD_LOG_PATH, "w")  -- truncate per session
+
+local function write_mod_log(line)
+    if mod_log_file then
+        mod_log_file:write(os.date("[%H:%M:%S] ") .. line .. "\n")
+        mod_log_file:flush()
+    end
+end
+
 local function log(msg)
     print(string.format("[%s] %s\n", MOD_NAME, msg))
+    write_mod_log(msg)
 end
 
 local function log_err(msg)
     print(string.format("[%s] ERROR: %s\n", MOD_NAME, msg))
+    write_mod_log("ERROR: " .. msg)
 end
 
 -- -----------------------------------------------------------------------------
@@ -749,14 +764,90 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                     PendingRestoreData = {}
 
                     local any = false
-                    for guid, json in pairs(to_restore) do
+                    for guid, restore_json in pairs(to_restore) do
                         local comp = SecondInventories[guid]
                         if comp then
                             local ok_v, is_v = pcall(function() return comp:IsValid() end)
                             if ok_v and is_v then
                                 log("OPI post-hook: restoring items for GUID=" .. guid:sub(1, 16) .. "...")
-                                populate_inventory(comp, json)
+                                populate_inventory(comp, restore_json)
                                 log("OPI post-hook: restore broadcast sent.")
+
+                                -- Diagnostic: check if ItemData is valid after broadcast.
+                                -- If IsValid=false the UI renders nothing even though GUID/Count are set.
+                                -- Attempt to fix via StaticFindObject + SetPropertyValue.
+                                local ok_sv, sv = pcall(function()
+                                    return comp:GetPropertyValue("ItemSlots")
+                                end)
+                                if ok_sv and sv then
+                                    local ok_dec, parsed = pcall(json.decode, restore_json)
+                                    if not ok_dec then
+                                        log_err("OPI fix: json.decode failed: " .. tostring(parsed))
+                                        parsed = nil
+                                    end
+                                    for i = 1, SECOND_INV_SLOTS do
+                                        local ok_sl, sl = pcall(function() return sv[i] end)
+                                        if ok_sl and sl then
+                                            local ok_gv, gv = pcall(function()
+                                                return sl:GetPropertyValue("GUID")
+                                            end)
+                                            if ok_gv and gv then
+                                                local ok_a, a = pcall(function() return gv.A end)
+                                                local ok_b, b = pcall(function() return gv.B end)
+                                                local am = ok_a and ((tonumber(a) or 0) & 0xFFFFFFFF) or 0
+                                                local bm = ok_b and ((tonumber(b) or 0) & 0xFFFFFFFF) or 0
+                                                if am ~= 0 or bm ~= 0 then
+                                                    -- Occupied slot found.
+                                                    local ok_iv, id_valid = pcall(function()
+                                                        return sl:GetPropertyValue("ItemData"):IsValid()
+                                                    end)
+                                                    log(string.format(
+                                                        "OPI fix: sv[%d] GUID.A=%08X ItemData:IsValid()=%s",
+                                                        i, am, tostring(ok_iv and id_valid)))
+
+                                                    -- If ItemData is invalid, try to fix it via StaticFindObject.
+                                                    if not (ok_iv and id_valid) then
+                                                        local json_key = tostring(i - 1)
+                                                        local slot_data = parsed and parsed[json_key]
+                                                        local item_path = slot_data and slot_data.ItemData
+                                                        if item_path and item_path ~= "" then
+                                                            -- Try the path as-is, then with _C suffix.
+                                                            local found = nil
+                                                            for _, try_path in ipairs({item_path, item_path .. "_C"}) do
+                                                                local ok_fo, fo = pcall(function()
+                                                                    return StaticFindObject(try_path)
+                                                                end)
+                                                                if ok_fo and fo and fo:IsValid() then
+                                                                    found = fo
+                                                                    log("OPI fix: StaticFindObject OK: " .. try_path)
+                                                                    break
+                                                                end
+                                                            end
+                                                            if found then
+                                                                local ok_set = pcall(function()
+                                                                    sl:SetPropertyValue("ItemData", found)
+                                                                end)
+                                                                log("OPI fix: SetPropertyValue(ItemData) = " .. tostring(ok_set))
+                                                                -- Re-check validity.
+                                                                local ok_iv2, id_valid2 = pcall(function()
+                                                                    return sl:GetPropertyValue("ItemData"):IsValid()
+                                                                end)
+                                                                log("OPI fix: ItemData:IsValid() after set = " .. tostring(ok_iv2 and id_valid2))
+                                                            else
+                                                                log("OPI fix: StaticFindObject failed for: " .. tostring(item_path))
+                                                            end
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+
+                                -- Try OnRep_ItemSlots to nudge the UI into re-rendering.
+                                local ok_rep = pcall(function() comp:OnRep_ItemSlots() end)
+                                log("OPI fix: OnRep_ItemSlots() = " .. tostring(ok_rep))
+
                                 any = true
                             else
                                 log("OPI post-hook: comp invalid for GUID=" .. guid:sub(1, 16))

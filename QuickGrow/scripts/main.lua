@@ -1,26 +1,28 @@
 -- ============================================================
---  QuickGrow v4.8 — UE4SS Lua Mod for RS: Dragonwilds
+--  QuickGrow v4.9 — UE4SS Lua Mod for RS: Dragonwilds
 --
---  v4.7 findings (the breakthrough):
---   * COMPLETE InGameTimeActor property list: RealTimeMinutesPer-
---     InGameDay, InitialTime, TimeOfDawn, TimeOfDusk, StoredTime,
---     LastSyncTime, bIsTimePaused. There is NO live-clock property
---     — current time lives in a non-reflected C++ member. That is
---     why StoredTime writes stick but change nothing.
---   * Reflection enumeration (ForEachProperty/ForEachFunction)
---     crashes natively on several classes. Banned permanently.
+--  v4.8 findings:
+--   * TimeOfDawn=24.0 flips CanSleep 4 -> 0 (dusk shift does
+--     nothing). Sleep(player) was then ACCEPTED — player got in
+--     bed — but:
+--     - IsSleeping sets asynchronously (instant check said false)
+--     - we restored dawn immediately, so the game's deferred
+--       "all sleeping -> advance day" night re-check failed and
+--       time never advanced.
+--   * CanSleep=3 is a non-time blocker (both shifts left it 3);
+--     likely "slept too recently".
 --
---  v4.8 fix — move the goalposts instead of the clock:
---   CanSleep's night check compares the (unreachable) current time
---   against TimeOfDawn/TimeOfDusk — plain float properties whose
---   writes are PROVEN to stick. On a daytime cast:
---     1. Set TimeOfDusk = 0.01  ("night" starts just after 00:00,
---        so any time of day counts as night)
---     2. CanSleep(player) should now be 0 -> Sleep(player)
---     3. Restore TimeOfDusk immediately (dawn untouched, so the
---        morning wake-up time stays correct)
---   Fallback if still blocked: also push TimeOfDawn to 24.0,
---   re-check, restore both.
+--  v4.9 result: dawn=24 ALONE does not flip CanSleep (stayed 4).
+--  In v4.8 the flip happened with dusk=0.01 AND dawn=24 applied
+--  cumulatively — the night check needs BOTH bounds shifted.
+--
+--  v5.0: shift BOTH bounds until the sleep completes.
+--   1. Set dusk=0.01 AND dawn=24 -> CanSleep==0 -> Sleep(player)
+--   2. Poll for IsSleeping==true (up to 5s)
+--   3. Poll for IsSleeping==false = woke up / day advanced
+--      (up to 60s)
+--   4. THEN restore dawn/dusk. StoredTime logged at each phase
+--      so we can verify the day jump and the wake-up hour.
 -- ============================================================
 
 local SPELL_HOOK = "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded"
@@ -111,54 +113,80 @@ local function findTimeActors()
     return out
 end
 
+local function storedTime(timeActors)
+    return try(function() return timeActors[1].StoredTime end)
+end
+
+-- ── Async poll helper ─────────────────────────────────────────
+local function poll(checkFn, intervalMs, timeoutMs, onDone)
+    local elapsed = 0
+    local function step()
+        ExecuteWithDelay(intervalMs, function()
+            ExecuteInGameThread(function()
+                elapsed = elapsed + intervalMs
+                if checkFn() then
+                    onDone(true)
+                elseif elapsed >= timeoutMs then
+                    onDone(false)
+                else
+                    step()
+                end
+            end)
+        end)
+    end
+    step()
+end
+
+-- ── Guard against overlapping casts ──────────────────────────
+local busy = false
+
 -- ── Day-advance core ─────────────────────────────────────────
 local function advanceWorldDay()
+    if busy then
+        log("Previous cast still in progress; ignoring.")
+        return
+    end
+
     if not valid(cache.player) then
         log("WARNING: Player not ready.")
-        return false
+        return
     end
 
     local bed = findPlayerBed()
     if not bed then
         log("WARNING: No bed found. Build and claim a bed first.")
-        return false
+        return
     end
 
     local bedComp = try(function() return bed.Bed end)
     if not valid(bedComp) then
         log("WARNING: BedComponent is nil.")
-        return false
+        return
     end
 
     local restComp = getRestComp()
 
     if isSleepingNow(restComp) then
         log("Already sleeping; skipping.")
-        return true
+        return
     end
 
     local function canSleep()
         return try(function() return bedComp:CanSleep(cache.player) end)
     end
 
-    local function trySleep()
-        pcall(function() bedComp:Sleep(cache.player) end)
-        return isSleepingNow(restComp)
-    end
-
-    -- 1. Night already? Just sleep.
+    -- 1. Night already? Just sleep (no bound changes needed).
     if canSleep() == 0 then
-        if trySleep() then
-            log("SUCCESS: night — slept directly.")
-            return true
-        end
+        pcall(function() bedComp:Sleep(cache.player) end)
+        log("Night: Sleep(player) called.")
+        return
     end
 
-    -- 2. Daytime: shrink the day instead of moving the clock.
+    -- 2. Daytime (or blocked).
     local timeActors = findTimeActors()
     if #timeActors == 0 then
         log("WARNING: no " .. TIME_CLASS .. " instances found.")
-        return false
+        return
     end
 
     local saved = {}
@@ -169,7 +197,7 @@ local function advanceWorldDay()
         }
     end
 
-    local function restoreAll()
+    local function restoreAll(reason)
         for i, ta in ipairs(timeActors) do
             if saved[i] then
                 if type(saved[i].dusk) == "number" then
@@ -180,45 +208,50 @@ local function advanceWorldDay()
                 end
             end
         end
+        busy = false
+        log("Bounds restored (" .. reason .. ").")
     end
 
-    log(string.format("Daytime (CanSleep=%s). Trying dusk shift...",
-        tostring(canSleep())))
+    local cs0 = canSleep()
+    log(string.format("Cast: CanSleep=%s, StoredTime=%s. Shifting dusk+dawn...",
+        tostring(cs0), tostring(storedTime(timeActors))))
 
-    -- Step A: dusk to 00:00:36 — any time >= dusk counts as night
+    busy = true
     for _, ta in ipairs(timeActors) do
         pcall(function() ta.TimeOfDusk = 0.01 end)
+        pcall(function() ta.TimeOfDawn = 24.0 end)
     end
+
     local cs = canSleep()
-    log("After TimeOfDusk=0.01: CanSleep=" .. tostring(cs))
-
-    -- Step B (fallback): dawn to 24.0 — any time < dawn counts as night
     if cs ~= 0 then
-        for _, ta in ipairs(timeActors) do
-            pcall(function() ta.TimeOfDawn = 24.0 end)
+        log(string.format(
+            "Blocked: CanSleep=%s even with both bounds shifted. %s",
+            tostring(cs),
+            cs == 3 and "(code 3 = non-time blocker, likely 'slept too recently' — wait a bit and recast)" or ""))
+        restoreAll("blocked")
+        return
+    end
+
+    pcall(function() bedComp:Sleep(cache.player) end)
+    log("Sleep(player) called. Waiting for sleep state (dawn stays shifted)...")
+
+    -- Phase 1: wait for sleep to engage
+    poll(function() return isSleepingNow(restComp) end, 250, 5000, function(engaged)
+        if not engaged then
+            restoreAll("sleep never engaged")
+            return
         end
-        cs = canSleep()
-        log("After TimeOfDawn=24.0: CanSleep=" .. tostring(cs))
-    end
+        log(string.format("Sleeping confirmed (StoredTime=%s). Waiting for day advance / wake...",
+            tostring(storedTime(timeActors))))
 
-    local slept = false
-    if cs == 0 then
-        slept = trySleep()
-    end
-
-    -- Restore window bounds immediately; dawn is what the wake-up
-    -- time is computed from, and it is back to normal before the
-    -- sleep fade finishes.
-    restoreAll()
-
-    if slept then
-        log("SUCCESS: dusk-shift accepted, sleeping — day should advance. Bounds restored.")
-        return true
-    end
-
-    log(string.format("FAILED: CanSleep=%s after both shifts (3=likely 'too early/recently slept'). Bounds restored.",
-        tostring(canSleep())))
-    return false
+        -- Phase 2: wait for wake (= day advanced)
+        poll(function() return not isSleepingNow(restComp) end, 500, 60000, function(woke)
+            log(string.format("%s StoredTime=%s.",
+                woke and "Woke up — day should have advanced." or "Timeout (60s) — still sleeping?",
+                tostring(storedTime(timeActors))))
+            restoreAll(woke and "woke" or "timeout")
+        end)
+    end)
 end
 
 -- ── Cast handler ──────────────────────────────────────────────
@@ -258,11 +291,11 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
         if ok_main then
             hook_registered = true
-            log("v4.8 ready.")
+            log("v5.0 ready.")
         else
             log("ERROR registering Oculus hook: " .. tostring(err_main))
         end
     end)
 end)
 
-print("[QuickGrow] v4.8 loaded.\n")
+print("[QuickGrow] v5.0 loaded.\n")

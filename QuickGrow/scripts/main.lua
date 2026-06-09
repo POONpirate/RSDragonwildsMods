@@ -1,32 +1,32 @@
 -- ============================================================
---  QuickGrow v4.3 (diagnostic) — UE4SS Lua Mod for RS: Dragonwilds
+--  QuickGrow v4.4 — UE4SS Lua Mod for RS: Dragonwilds
 --
---  v4.2 log findings:
---   * The working physical night-sleep calls EXACTLY
---     BedComponent:Sleep(player) — same self, same param, nothing
---     before it. Our call signature is correct.
---   * Therefore Sleep() no-ops during the day because of its
---     INTERNAL time-of-day check (native CanSleep), which we
---     cannot override. The fix must come from the time system.
---   * SetRestingArea takes exactly 1 param (an Actor). Passing a
---     BedComponent CRASHED the game natively. All blind probing
---     with guessed object params is removed.
+--  v4.3 log findings:
+--   * TIME SYSTEM FOUND: BP_InGameTimeActor_C
+--       RealTimeMinutesPerInGameDay = 24  (1 real s = 60 game s)
+--       TimeOfDawn = 4.5, TimeOfDusk = 22.0
+--       StoredTime = 272430 (game seconds), LastSyncTime (real s)
+--   * CanSleep signature confirmed: CanSleep(player) -> 4 (day)
+--   * Generic property dumping CRASHES on exotic property types
+--     (died right after bIsTimePaused). v4.4 reads/writes only
+--     known-safe numeric props by name.
 --
---  v4.3 behavior on Oculus cast:
---   1. Call bedComp:Sleep(player) — works if it's night.
---   2. If IsSleeping is still false (daytime), run a one-time
---     READ-ONLY discovery sweep to find the time-of-day system:
---       - scan all actors for time/day/night/sky/clock classes
---         and dump their time-related property values
---       - dump time-related props on GameMode/GameState
---       - probe /Script/Dominion time-class and function names
---         (RegisterHook registration only — nothing is called
---         with guessed params)
---   Send UE4SS.log back after one daytime cast.
+--  v4.4 strategy on Oculus cast:
+--   1. Try Sleep(player) — works if already night.
+--   2. Else: advance InGameTimeActor.StoredTime by 1 game-hour
+--      steps until CanSleep(player) == 0 (self-calibrating, no
+--      unit guessing), then Sleep(player) -> day advances.
+--      On total failure, StoredTime is restored.
+--   3. One-time, also log the time actor's class chain and own
+--      function names (BP classes enumerate fine) for fallback.
 -- ============================================================
 
 local SPELL_HOOK = "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded"
 local BED_CLASS  = "BP_BaseBuilding_Bed_C"
+local TIME_CLASS = "BP_InGameTimeActor_C"
+
+local GAME_HOUR    = 3600  -- StoredTime appears to be in game-seconds
+local MAX_HOPS     = 30    -- max 1-hour bumps before giving up
 
 -- ── Helpers ──────────────────────────────────────────────────
 local function log(msg)
@@ -107,45 +107,33 @@ local function isSleepingNow(restComp)
     return v == true
 end
 
--- ── Time-system discovery (READ-ONLY) ────────────────────────
-local discovered = false
-
-local TIME_PATTERNS = { "time", "day", "night", "sky", "sun", "moon",
-                        "clock", "weather", "season", "morning" }
--- Engine-level noise we don't care about
-local NOISE = {
-    CustomTimeDilation = true, CreationTime = true, LastRenderTime = true,
-    TimerHandle_LifeSpanExpired = true, UnpausedTimeSeconds = true,
-    AudioTimeSeconds = true, DeltaRealTimeSeconds = true,
-    RealTimeSeconds = true, TimeSeconds = true, PauseDelay = true,
-}
-
-local function nameMatches(name)
-    local l = string.lower(name)
-    for _, p in ipairs(TIME_PATTERNS) do
-        if string.find(l, p, 1, true) then return true end
+-- ── Time actor ────────────────────────────────────────────────
+local function findTimeActor()
+    local actors = FindAllOf(TIME_CLASS)
+    if actors then
+        for _, a in ipairs(actors) do
+            if valid(a) then return a end
+        end
     end
-    return false
+    return nil
 end
 
-local function classNameOf(obj)
-    return try(function() return obj:GetClass():GetFName():ToString() end) or "?"
-end
-
-local function dumpTimeProps(obj, label)
-    local cls = try(function() return obj:GetClass() end)
+-- One-time info dump: class chain + own function names.
+-- (Name enumeration only — never reads property values generically,
+--  which is what crashed v4.3.)
+local infoDumped = false
+local function dumpTimeActorInfo(timeActor)
+    if infoDumped then return end
+    infoDumped = true
+    log("Time actor class chain & functions:")
+    local cls = try(function() return timeActor:GetClass() end)
     local depth = 0
     while cls ~= nil and depth < 8 do
+        log("  CLASS: " .. (try(function() return cls:GetFullName() end) or "?"))
         pcall(function()
-            cls:ForEachProperty(function(prop)
-                local pname = try(function() return prop:GetFName():ToString() end)
-                if pname and not NOISE[pname] and nameMatches(pname) then
-                    local val = try(function() return obj[pname] end)
-                    local t = type(val)
-                    local sval = (t == "number" or t == "boolean" or t == "string")
-                        and tostring(val) or describe(val)
-                    log(string.format("    %s.%s = %s", label, pname, sval))
-                end
+            cls:ForEachFunction(function(fn)
+                local fname = try(function() return fn:GetFName():ToString() end)
+                if fname then log("    fn: " .. fname) end
             end)
         end)
         cls = try(function() return cls:GetSuperStruct() end)
@@ -153,91 +141,7 @@ local function dumpTimeProps(obj, label)
     end
 end
 
-local function discoverTimeSystem()
-    if discovered then return end
-    discovered = true
-    log("=== TIME SYSTEM DISCOVERY (read-only) ===")
-
-    -- 1. Actor sweep: any actor whose class name smells like time/sky
-    local actors = FindAllOf("Actor")
-    local seen = {}
-    if actors then
-        log(string.format("Sweeping %d actors...", #actors))
-        for _, a in ipairs(actors) do
-            if valid(a) then
-                local cname = classNameOf(a)
-                if cname ~= "?" and nameMatches(cname) and not seen[cname] then
-                    seen[cname] = true
-                    log("  ACTOR: " .. cname)
-                    log("    " .. describe(a))
-                    dumpTimeProps(a, cname)
-                end
-            end
-        end
-    else
-        log("FindAllOf('Actor') returned nil")
-    end
-
-    -- 2. GameMode / GameState property scan
-    for _, gname in ipairs({ "DominionGameMode", "DominionGameState",
-                             "GameModeBase", "GameStateBase" }) do
-        local objs = FindAllOf(gname)
-        if objs then
-            for _, o in ipairs(objs) do
-                if valid(o) then
-                    log("  FOUND " .. gname .. ": " .. describe(o))
-                    dumpTimeProps(o, gname)
-                    break
-                end
-            end
-        end
-    end
-
-    -- 3. Native class existence probes
-    local classes = {
-        "TimeOfDayManager", "TimeOfDaySubsystem", "TimeOfDayComponent",
-        "TimeManager", "TimeSubsystem", "GameTimeSubsystem",
-        "DayNightManager", "DayNightCycle", "DayNightSubsystem",
-        "WorldTimeSubsystem", "WorldClock", "SkyManager",
-        "WeatherManager", "EnvironmentManager", "DominionTimeSubsystem",
-        "SleepManager", "SleepSubsystem",
-    }
-    for _, c in ipairs(classes) do
-        local path = "/Script/Dominion." .. c
-        local cls = try(function() return StaticFindObject(path) end)
-        if cls and valid(cls) then
-            log("  CLASS EXISTS: " .. path)
-        end
-    end
-
-    -- 4. Function existence probes on GameMode/GameState
-    --    (RegisterHook with empty callbacks — never called by us)
-    local fnames = {
-        "SkipNight", "SkipToMorning", "SkipToDay", "AdvanceDay",
-        "StartNewDay", "StartNextDay", "AdvanceToMorning",
-        "SetTimeOfDay", "SetTime", "AdvanceTime", "AddTime",
-        "SetDayTime", "SetNightTime",
-        "GetTimeOfDay", "GetNormalizedTimeOfDay", "GetCurrentDay",
-        "IsNight", "IsNightTime", "IsDayTime",
-        "WakeAllPlayers", "OnAllPlayersSlept", "CheckAllPlayersSleeping",
-        "OnPlayerSleepStateChanged", "TrySkipNight",
-    }
-    for _, cp in ipairs({ "/Script/Dominion.DominionGameMode",
-                          "/Script/Dominion.DominionGameState" }) do
-        for _, f in ipairs(fnames) do
-            local ok, res = pcall(function()
-                return RegisterHook(cp .. ":" .. f, function() end, function() end)
-            end)
-            if ok and res ~= nil then
-                log("  FN HIT: " .. cp .. ":" .. f)
-            end
-        end
-    end
-
-    log("=== DISCOVERY COMPLETE — send UE4SS.log back ===")
-end
-
--- ── Day-advance entry point ──────────────────────────────────
+-- ── Day-advance core ─────────────────────────────────────────
 local function advanceWorldDay()
     if not valid(cache.player) then
         log("WARNING: Player not ready.")
@@ -263,22 +167,72 @@ local function advanceWorldDay()
         return true
     end
 
-    -- CanSleep signature check (safe: wrong param COUNT only errors in Lua)
-    local cs0 = try(function() return bedComp:CanSleep() end)
-    local cs1 = try(function() return bedComp:CanSleep(cache.player) end)
-    log(string.format("CanSleep()=%s  CanSleep(player)=%s  (0=ok, 4=not night)",
-        tostring(cs0), tostring(cs1)))
+    local function canSleep()
+        return try(function() return bedComp:CanSleep(cache.player) end)
+    end
 
-    -- Known-good call; works when the time check passes (night)
-    pcall(function() bedComp:Sleep(cache.player) end)
+    local function trySleep()
+        pcall(function() bedComp:Sleep(cache.player) end)
+        return isSleepingNow(restComp)
+    end
 
-    if isSleepingNow(restComp) then
-        log("SUCCESS: Sleep(player) accepted — day should advance.")
+    -- 1. Night already? Just sleep.
+    if canSleep() == 0 then
+        if trySleep() then
+            log("SUCCESS: night — slept directly.")
+            return true
+        end
+    end
+
+    -- 2. Daytime: advance the in-game clock until night.
+    local timeActor = findTimeActor()
+    if not valid(timeActor) then
+        log("WARNING: " .. TIME_CLASS .. " not found.")
+        return false
+    end
+
+    dumpTimeActorInfo(timeActor)
+
+    local original = try(function() return timeActor.StoredTime end)
+    if type(original) ~= "number" then
+        log("WARNING: StoredTime not readable (got " .. tostring(original) .. ").")
+        return false
+    end
+
+    log(string.format("Daytime (CanSleep=%s). StoredTime=%.0f — advancing clock...",
+        tostring(canSleep()), original))
+
+    local hops = 0
+    local slept = false
+    while hops < MAX_HOPS do
+        hops = hops + 1
+        local okSet = pcall(function()
+            timeActor.StoredTime = timeActor.StoredTime + GAME_HOUR
+        end)
+        if not okSet then
+            log("WARNING: writing StoredTime failed.")
+            break
+        end
+        local cs = canSleep()
+        if cs == 0 then
+            log(string.format("Night reached after +%d game-hour(s) (StoredTime=%.0f).",
+                hops, try(function() return timeActor.StoredTime end) or -1))
+            slept = trySleep()
+            break
+        end
+    end
+
+    if slept then
+        log("SUCCESS: clock advanced to night, Sleep(player) accepted — day should advance.")
         return true
     end
 
-    log("Sleep(player) blocked (daytime). Running time-system discovery...")
-    discoverTimeSystem()
+    -- Failure: restore the clock so we don't leave time corrupted.
+    pcall(function() timeActor.StoredTime = original end)
+    log(string.format(
+        "FAILED after %d hops (CanSleep=%s). StoredTime restored to %.0f. " ..
+        "Send UE4SS.log back (function list above is the fallback plan).",
+        hops, tostring(canSleep()), original))
     return false
 end
 
@@ -288,23 +242,6 @@ local function onOculusCast()
         refreshCache()
         if not valid(cache.player) then log("Player not ready"); return end
         advanceWorldDay()
-    end)
-end
-
--- ── Observer (confirms game-side Sleep calls; read-only) ─────
-local function registerObserver(path)
-    pcall(function()
-        RegisterHook(path, function(self, ...)
-            local n = select("#", ...)
-            local selfObj = try(function() return self:get() end)
-            log(string.format("OBSERVE %s | self=%s | %d param(s)",
-                path, describe(selfObj), n))
-            for i = 1, n do
-                local p = select(i, ...)
-                log(string.format("  param %d: %s",
-                    i, describe(try(function() return p:get() end))))
-            end
-        end)
     end)
 end
 
@@ -327,8 +264,6 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
             )
         end)
 
-        registerObserver("/Script/Dominion.BedComponent:Sleep")
-
         local ok_main, err_main = pcall(function()
             RegisterHook(SPELL_HOOK,
                 function(self, Instance) onOculusCast() end,
@@ -338,11 +273,11 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
         if ok_main then
             hook_registered = true
-            log("v4.3 diagnostic ready.")
+            log("v4.4 ready.")
         else
             log("ERROR registering Oculus hook: " .. tostring(err_main))
         end
     end)
 end)
 
-print("[QuickGrow] v4.3 (diagnostic) loaded.\n")
+print("[QuickGrow] v4.4 loaded.\n")

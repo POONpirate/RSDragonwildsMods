@@ -313,11 +313,44 @@ local function guid_any_to_hex(s)
     return nil
 end
 
+-- Find a UFunction by name on a class (walking the super chain).
+-- NOTE: StaticFindObject does NOT resolve "Class:Function" paths in this build
+-- (run-6: all reflections failed) — but ForEachFunction on the class works.
+local function find_ufunction(cls, fname)
+    local target = nil
+    local depth = 0
+    while cls and depth < 6 do
+        pcall(function()
+            cls:ForEachFunction(function(fn)
+                local n = ""
+                pcall(function() n = fn:GetFName():ToString() end)
+                if n == fname then
+                    target = fn
+                    return true  -- early-out if supported
+                end
+            end)
+        end)
+        if target then return target end
+        local ok_su, su = pcall(function() return cls:GetSuperStruct() end)
+        if not (ok_su and su) then break end
+        cls = su
+        depth = depth + 1
+    end
+    return nil
+end
+
 -- Reflect a UFunction's parameter list: { {name=..., type=...}, ... }.
 -- UFunction params (incl. out/return) are properties on the function object.
-local function get_ufunction_params(fn_path)
-    local ok_fn, fn = pcall(StaticFindObject, fn_path)
-    if not ok_fn or not fn or not fn:IsValid() then return nil end
+local UFN_PARAM_CACHE = {}
+local function get_ufunction_params(cls, fname)
+    if UFN_PARAM_CACHE[fname] ~= nil then
+        return UFN_PARAM_CACHE[fname] or nil  -- false caches a failed lookup
+    end
+    local fn = find_ufunction(cls, fname)
+    if not fn then
+        UFN_PARAM_CACHE[fname] = false
+        return nil
+    end
     local params = {}
     local ok_fe = pcall(function()
         fn:ForEachProperty(function(prop)
@@ -327,7 +360,11 @@ local function get_ufunction_params(fn_path)
             params[#params + 1] = { name = nm, type = ty }
         end)
     end)
-    if not ok_fe then return nil end
+    if not ok_fe then
+        UFN_PARAM_CACHE[fname] = false
+        return nil
+    end
+    UFN_PARAM_CACHE[fname] = params
     return params
 end
 
@@ -336,7 +373,9 @@ end
 -- "slot"→slot index, "count"/"num"/"amount"→count, StructProperty→FGuid table,
 -- BoolProperty→true, everything else→zero values. ReturnValue is skipped.
 local function call_inventory_fn(comp, fname, item_obj, slot_idx, count, guid_hex)
-    local params = get_ufunction_params("/Script/Dominion.InventoryComponent:" .. fname)
+    local ok_cls, cls = pcall(function() return comp:GetClass() end)
+    if not ok_cls or not cls then return false, "GetClass failed" end
+    local params = get_ufunction_params(cls, fname)
     if not params then return false, "reflection unavailable" end
     local args, desc = {}, {}
     for _, p in ipairs(params) do
@@ -1561,19 +1600,24 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
 
         -- One-shot dump of the add/remove function signatures (param names+types)
         -- so the auto-arg builder's choices can be validated from the log.
-        for _, fname in ipairs({
-            "AddItem", "AddItems", "AddItemByData", "AddItemsByData",
-            "AddItemByDataToSlot", "AddItemToSlot", "RemoveFromSlot",
-            "GetItemFromSlot", "CanAddItemByData",
-        }) do
-            local params = get_ufunction_params("/Script/Dominion.InventoryComponent:" .. fname)
-            if params then
-                local sig = {}
-                for _, p in ipairs(params) do sig[#sig + 1] = p.name .. ":" .. p.type end
-                log("FPARAM " .. fname .. "(" .. table.concat(sig, ", ") .. ")")
-            else
-                log("FPARAM " .. fname .. ": reflection failed")
+        local ok_invcls, invcls = pcall(StaticFindObject, "/Script/Dominion.InventoryComponent")
+        if ok_invcls and invcls and invcls:IsValid() then
+            for _, fname in ipairs({
+                "AddItem", "AddItems", "AddItemByData", "AddItemsByData",
+                "AddItemByDataToSlot", "AddItemToSlot", "RemoveFromSlot",
+                "GetItemFromSlot", "CanAddItemByData",
+            }) do
+                local params = get_ufunction_params(invcls, fname)
+                if params then
+                    local sig = {}
+                    for _, p in ipairs(params) do sig[#sig + 1] = p.name .. ":" .. p.type end
+                    log("FPARAM " .. fname .. "(" .. table.concat(sig, ", ") .. ")")
+                else
+                    log("FPARAM " .. fname .. ": reflection failed")
+                end
             end
+        else
+            log_err("FPARAM: InventoryComponent class not found via StaticFindObject.")
         end
 
         -- -----------------------------------------------------------------------

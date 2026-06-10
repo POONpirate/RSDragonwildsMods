@@ -363,7 +363,7 @@ local function get_ufunction_params(cls, fname)
         end)
     end)
     if not ok_fe then
-        log("reflect: " .. fname .. " ForEachProperty err: " .. tostring(fe_err):sub(-80))
+        log("reflect: " .. fname .. " ForEachProperty err: " .. tostring(fe_err):sub(1, 200))
         return nil
     end
     UFN_PARAM_CACHE[fname] = params
@@ -696,9 +696,37 @@ local function serialize_item_slots(inv_comp)
 
         -- PersistenceID: the b64 GUID string the engine's save format uses for
         -- ItemData (property on DominionDataAsset, base of all item assets).
+        -- Fallback: the UItem's own ItemDataPersistenceId FString (per CXX dump,
+        -- each slot entry IS a UItem object carrying a copy of the id).
         local persist_id = ""
         if ok_d and dv ~= nil and type(dv) ~= "string" then
             persist_id = get_persistence_id(dv)
+        end
+        if persist_id == "" then
+            local ok_pid2, pid2 = pcall(function()
+                return slot:GetPropertyValue("ItemDataPersistenceId")
+            end)
+            if ok_pid2 and pid2 ~= nil then
+                if type(pid2) == "string" then persist_id = pid2
+                else pcall(function() persist_id = tostring(pid2:ToString()) end) end
+            end
+        end
+
+        -- Durability: saved only for items that actually have durability
+        -- (ItemData.BaseDurability > 0), mirroring the engine save format.
+        local durability_part = ""
+        if ok_d and dv ~= nil and type(dv) ~= "string" then
+            local ok_bd, bd = pcall(function()
+                return tonumber(dv:GetPropertyValue("BaseDurability"))
+            end)
+            if ok_bd and bd and bd > 0 then
+                local ok_du, du = pcall(function()
+                    return tonumber(slot:GetPropertyValue("Durability"))
+                end)
+                if ok_du and du and du >= 0 then
+                    durability_part = string.format(',"Durability":%d', du)
+                end
+            end
         end
 
         local json_idx = i - 1
@@ -706,11 +734,12 @@ local function serialize_item_slots(inv_comp)
         -- to legacy hex/path when conversion isn't possible (restore handles both).
         local b64_guid = guid_hex_to_b64(guid_str)
         parts[#parts + 1] = string.format(
-            ',"%d":{"GUID":"%s","ItemData":"%s","Count":%d}',
+            ',"%d":{"GUID":"%s","ItemData":"%s","Count":%d%s}',
             json_idx,
             b64_guid or guid_str,
             (persist_id ~= "" and persist_id or item_data_str):gsub('"', '\\"'),
-            count_val)
+            count_val,
+            durability_part)
         if item_data_str ~= "" then
             sidecar_parts[#sidecar_parts + 1] = string.format(
                 '%s"%d":"%s"', (#sidecar_parts > 0 and "," or ""),
@@ -1096,30 +1125,10 @@ local function restore_inventory(guid, comp, restore_json)
         end
     end)
 
-    -- Make sure AllowAdds isn't blocking the engine add functions.
+    -- Make sure adds aren't blocked (property is named bAllowAdds per the
+    -- CXX header dump; set both spellings defensively).
+    pcall(function() comp:SetPropertyValue("bAllowAdds", true) end)
     pcall(function() comp:SetPropertyValue("AllowAdds", true) end)
-
-    -- One-shot signature dump using the LIVE component's class — the same
-    -- context FNDUMP succeeded in. (StaticFindObject class wrappers don't
-    -- expose ForEachFunction in this build; run-7 proved that.)
-    if not _dumped_fparams then
-        _dumped_fparams = true
-        local ok_cc, cc = pcall(function() return comp:GetClass() end)
-        if ok_cc and cc then
-            for _, fname in ipairs({
-                "AddItem", "AddItems", "AddItemByData", "AddItemsByData",
-                "AddItemByDataToSlot", "AddItemToSlot", "RemoveFromSlot",
-                "GetItemFromSlot", "CanAddItemByData",
-            }) do
-                local params = get_ufunction_params(cc, fname)
-                if params then
-                    local sig = {}
-                    for _, p in ipairs(params) do sig[#sig + 1] = p.name .. ":" .. p.type end
-                    log("FPARAM " .. fname .. "(" .. table.concat(sig, ", ") .. ")")
-                end
-            end
-        end
-    end
 
     -- 2. Fallback: any slot the engine didn't fill gets restored through the
     --    engine's own add functions.
@@ -1163,30 +1172,45 @@ local function restore_inventory(guid, comp, restore_json)
                 goto next_slot
             end
 
-            -- Engine-native add with reflected signatures (run-5 showed
-            -- AddItemByDataToSlot wants 6 params, AddItemByData wants 5 —
-            -- args are auto-built from the UFunction's parameter list).
+            -- Engine-native add. EXACT signature from the CXX header dump:
+            -- bool AddItemByDataToSlot(const UItemData* ItemData, int32 SlotIndex,
+            --     int32 Count, float DurabilityPercentage,
+            --     const FGameplayTagContainer& GameplayTags)
+            -- The engine constructs a UItem and places it in ItemSlots[SlotIndex].
             local cnt = tonumber(slot_data.Count) or 1
-            local ghex = guid_any_to_hex(slot_data.GUID)
-            local added = false
-            for _, fname in ipairs({ "AddItemByDataToSlot", "AddItemByData", "AddItemToSlot" }) do
-                local ok_call, ret = call_inventory_fn(comp, fname, found, idx, cnt, ghex)
-                log(string.format("restore: slot %d %s ok=%s ret=%s",
-                    idx, fname, tostring(ok_call), tostring(ret):sub(1, 160)))
-                local now_set = scan_occupied_slots(comp)
-                if now_set[idx] then
-                    added = true
-                    log("restore: slot " .. idx .. " now occupied via " .. fname)
-                    break
-                end
-                if ok_call and (ret == true or (tonumber(ret) or 0) > 0) then
-                    added = true
-                    log("restore: " .. fname .. " reported success (slot may differ).")
-                    break
-                end
+            local ok_add, ret_add = pcall(function()
+                return comp:AddItemByDataToSlot(found, idx, cnt, 100.0, {})
+            end)
+            log(string.format("restore: slot %d AddItemByDataToSlot ok=%s ret=%s",
+                idx, tostring(ok_add), tostring(ret_add):sub(1, 160)))
+
+            local now_set = scan_occupied_slots(comp)
+            if not now_set[idx] then
+                log_err("restore: slot " .. idx .. " still empty after add.")
+                goto next_slot
             end
-            if not added then
-                log_err("restore: slot " .. idx .. " could not be filled by engine adds.")
+            log("restore: slot " .. idx .. " now occupied.")
+
+            -- Post-fix the new UItem (a real UObject — property writes stick,
+            -- unlike the FItemSlot-struct misunderstanding of earlier attempts):
+            -- restore the original instance Guid and saved Durability.
+            local ok_it, it = pcall(function() return comp:GetItemFromSlot(idx) end)
+            if ok_it and it then
+                local ghex = guid_any_to_hex(slot_data.GUID)
+                if ghex then
+                    local ok_g, gv = pcall(function() return it:GetPropertyValue("Guid") end)
+                    if ok_g and gv then
+                        local ok_wg, wg = write_fguid(gv, ghex)
+                        log("restore: slot " .. idx .. " Guid write ok=" .. tostring(ok_wg)
+                            .. " (" .. tostring(wg) .. ")")
+                    end
+                end
+                local dur = tonumber(slot_data.Durability)
+                if dur then
+                    pcall(function() it:SetPropertyValue("Durability", dur) end)
+                    pcall(function() it:OnRep_Durability() end)
+                    log("restore: slot " .. idx .. " Durability set to " .. dur)
+                end
             end
         end
         ::next_slot::
@@ -1370,6 +1394,67 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
             end
         end
         log("Item-movement hooks registered: " .. item_hook_count .. " / " .. #ITEM_HOOKS)
+
+        -- -----------------------------------------------------------------------
+        -- Add-function parameter spy
+        -- ForEachProperty doesn't work on UFunction wrappers in this UE4SS build,
+        -- so learn the Add* signatures from live gameplay instead: hook them on
+        -- the BASE InventoryComponent (the ITEM_HOOKS on PersonalInventoryComponent
+        -- registered 0/20 — these functions live on the base class) and log the
+        -- first few firings with full parameter values. Any item pickup fires them.
+        -- -----------------------------------------------------------------------
+        local ADD_SPY_FNS = {
+            "AddItem", "AddItems", "AddItemByData", "AddItemsByData",
+            "AddItemByDataToSlot", "AddItemToSlot", "RemoveFromSlot",
+        }
+        local add_spy_counts = {}
+        local add_spy_registered = 0
+        for _, sf in ipairs(ADD_SPY_FNS) do
+            local ok_sp = pcall(function()
+                RegisterHook("/Script/Dominion.InventoryComponent:" .. sf,
+                    function(self, ...)
+                        add_spy_counts[sf] = (add_spy_counts[sf] or 0) + 1
+                        if add_spy_counts[sf] > 3 then return end
+                        local args = { ... }
+                        log("ADDSPY " .. sf .. " fired with " .. #args .. " params:")
+                        for ai, p in ipairs(args) do
+                            local desc = type(p)
+                            if type(p) == "userdata" then
+                                local ok_g, v = pcall(function() return p:get() end)
+                                if ok_g and v ~= nil then
+                                    local vt = type(v)
+                                    if vt == "userdata" then
+                                        local s = nil
+                                        local ok_fn2, fn2 = pcall(function() return v:GetFullName() end)
+                                        if ok_fn2 and fn2 and tostring(fn2) ~= "" then
+                                            s = tostring(fn2)
+                                        else
+                                            pcall(function() s = tostring(v:ToString()) end)
+                                        end
+                                        -- FGuid? read sub-fields.
+                                        local gh = ""
+                                        pcall(function() gh = norm_guid_hex(read_fguid(v)) end)
+                                        desc = "wrapped userdata: " .. tostring(s):sub(1, 90)
+                                            .. (#gh == 32 and (" FGUID=" .. gh) or "")
+                                    else
+                                        desc = "wrapped " .. vt .. " = " .. tostring(v)
+                                    end
+                                else
+                                    local ok_ts, ts = pcall(function() return p:ToString() end)
+                                    desc = "userdata" .. ((ok_ts and ts) and (" ts=" .. tostring(ts):sub(1, 60)) or "")
+                                end
+                            else
+                                desc = desc .. " = " .. tostring(p)
+                            end
+                            log("ADDSPY   param[" .. ai .. "] " .. desc)
+                        end
+                    end,
+                    function() end
+                )
+            end)
+            if ok_sp then add_spy_registered = add_spy_registered + 1 end
+        end
+        log("ADDSPY hooks registered: " .. add_spy_registered .. " / " .. #ADD_SPY_FNS)
 
         local reg_ok, reg_err = pcall(function()
             RegisterHook(SPELL_HOOK,

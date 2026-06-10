@@ -532,10 +532,10 @@ end
 -- Main serializer
 -- ---------------------------------------------------------------------------
 local function serialize_item_slots(inv_comp)
-    -- 1. Try calling functions that might update JsonInventory from ItemSlots.
-    local forced = try_force_json(inv_comp)
-    if forced then return forced end
-
+    -- The LIVE ItemSlots array is the ONLY source of truth. Never read
+    -- JsonInventory here — we write that property ourselves at cast time, so
+    -- it's a stale snapshot (run-12 bug: saves captured the chest as it was
+    -- when opened, losing every change made after).
     local ok_s, sv = pcall(function()
         return inv_comp:GetPropertyValue("ItemSlots")
     end)
@@ -762,8 +762,10 @@ local function serialize_item_slots(inv_comp)
     end
 
     if max_idx < 0 then
-        log("serialize: no items found (GUID sub-fields all zero or unreadable).")
-        return nil
+        -- Empty is an AUTHORITATIVE state (user may have removed everything) —
+        -- return a valid empty engine-format save, not nil, so it gets written.
+        log("serialize: no items — emitting empty inventory JSON.")
+        return '{"Version":67,"MaxSlotIndex":' .. (SECOND_INV_SLOTS - 1) .. '}', "{}"
     end
 
     -- Mirror the engine's PersonalInventory format exactly (no AllowAdds).
@@ -798,35 +800,15 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
     local to_write = nil
     local sidecar_json = nil
 
-    -- Priority 1: manually serialize ItemSlots → JSON (engine format).
-    -- This is the primary path because the engine never writes item data back into
-    -- JsonInventory for our dynamic component.
+    -- Serialize the LIVE ItemSlots — the only source of truth. No JsonInventory
+    -- or cached fallbacks: both are stale snapshots and caused run-12's lost
+    -- changes (and would dupe items back after the user empties the chest).
     to_write, sidecar_json = serialize_item_slots(inv_comp)
 
-    -- Priority 2: live JsonInventory (populated if the engine did serialize it).
     if not to_write then
-        local ok_json, json_str = pcall(function()
-            return inv_comp:GetPropertyValue("JsonInventory"):ToString()
-        end)
-        log("save: live JsonInventory len=" .. (ok_json and json_str and tostring(#json_str) or "err"))
-        if ok_json and json_str and json_str ~= ""
-           and json_str ~= SLOT_LAYOUT_JSON and json_str ~= EMPTY_INV_JSON then
-            to_write = json_str
-            log("save: using live JsonInventory.")
-        end
-    end
-
-    -- Priority 3: cached snapshot captured from the post-open hook.
-    if not to_write and fallback_json and fallback_json ~= ""
-       and fallback_json ~= SLOT_LAYOUT_JSON and fallback_json ~= EMPTY_INV_JSON then
-        to_write = fallback_json
-        log("save: using cached fallback JSON.")
-    end
-
-    if not to_write then
-        -- Note: when empty, the existing file is left untouched — so any
-        -- unrestored items recorded for this guid survive in the old file.
-        log("save: inventory is empty — nothing written for GUID " .. guid)
+        -- ItemSlots unreadable (error, not "empty") — leave the existing file
+        -- untouched rather than risk writing bad state.
+        log_err("save: ItemSlots unreadable — existing save left untouched for GUID " .. guid)
         return nil
     end
 

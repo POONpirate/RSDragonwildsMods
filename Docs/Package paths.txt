@@ -19,3 +19,25 @@ RSDragonwilds/Content/Gameplay/UtilityMagic/PerkSpells/BonestoPeaches/BP_PerkSpe
 RSDragonwilds/Content/Gameplay/UtilityMagic/PerkSpells/EyeOfOculus/USD_EyeOfOculus.uasset
 
 RSDragonwilds/Content/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.uasset
+
+RSDragonwilds/Content/Gameplay/BaseBuilding_New/BuildingPieces/Tier1_Brynmoor/Farming/DA_FarmPlot_T1_Brynmoor.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding_New/BuildingPieces/Tier1_Brynmoor/Farming/DA_FarmPlot_T2_Ghronfell.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding_New/BuildingPieces/Tier1_Brynmoor/Farming/DA_FarmPlot_T3_Fellhollow.uasset
+
+RSDragonwilds/Content/Gameplay/BaseBuilding_New/BuildingPieces/Tier1_Brynmoor/Farming/BP_FarmPlot1x1_Base.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding_New/BuildingPieces/Tier1_Brynmoor/Farming/BP_FarmPlot1x1_T1.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding_New/BuildingPieces/Tier1_Brynmoor/Farming/BP_FarmPlot1x1_T2.uasset
+RSDragonwilds/Content/Gameplay/BaseBuilding_New/BuildingPieces/Tier1_Brynmoor/Farming/BP_FarmPlot1x1_T3.uasset
+
+RSDragonwilds/Content/Gameplay/Farming/Stages/Cabbage_Stages/FPSD_CabbagePlantStage1.uasset
+
+RSDragonwilds/Content/Gameplay/Farming/Plants/FPD_Cabbage.uasset
+
+RSDragonwilds/Content/Gameplay/GameMode/BP_GameMode.uasset
+RSDragonwilds/Content/Gameplay/GameMode/BP_GameState.uasset
+
+RSDragonwilds/Content/Gameplay/Character/Components/BP_Components_Rest.uasset
+
+RSDragonwilds/Content/Gameplay/BaseBuilding/Data/BuildingPieces/Furniture/Comfort/BUILDPIECE_Interior_Bed.uasset
+
+RSDragonwilds/Content/Gameplay/BaseBuilding/Actors/Props/Cosiness/BP_BaseBuilding_Bed.uasset

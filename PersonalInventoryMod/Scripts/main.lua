@@ -528,6 +528,30 @@ local function harvest_content_attrs(content_json)
     end
 end
 
+-- Read the game's character save straight from disk (the load-RPC hook fires
+-- before our hooks register, so it can't be relied on for the first load).
+-- Add the correct path here if the default guesses miss.
+local CHARACTER_SAVE_PATHS = {
+    (os.getenv("LOCALAPPDATA") or "") .. "\\RSDragonwilds\\Saved\\SaveGames\\CharacterSave.json",
+    (os.getenv("LOCALAPPDATA") or "") .. "\\RSDragonwilds\\Saved\\CharacterSave.json",
+}
+local function harvest_from_disk()
+    for _, p in ipairs(CHARACTER_SAVE_PATHS) do
+        local f = io.open(p, "r")
+        if f then
+            local c = f:read("*a")
+            f:close()
+            if c and #c > 2 then
+                log("harvest: reading character save from disk: " .. p)
+                pcall(harvest_content_attrs, c)
+                return true
+            end
+        end
+    end
+    log("harvest: no character save found on disk — content-type cache may be stale.")
+    return false
+end
+
 -- ---------------------------------------------------------------------------
 -- Force-JSON helpers — try calling component functions that might serialize
 -- ItemSlots back into JsonInventory (the way the game's own save path does).
@@ -923,11 +947,17 @@ local function serialize_item_slots(inv_comp)
             end
         end
         write_mod_log("serialize: extras done slot " .. (i - 1))
-        if content_qty then
-            extra_parts = extra_parts .. string.format(',"RemainingFillCharges":%d', content_qty)
-        end
-        if content_pid ~= "" and content_pid ~= "None" then
-            extra_parts = extra_parts .. string.format(',"ContentItemData":"%s"', content_pid)
+        -- PAIRED OR NOTHING: the engine applies these from JsonInventory when
+        -- the item lands in a slot — charges with no content type renders a
+        -- broken fill bar and crashes the UI (runs 16/17). Never emit one
+        -- without the other.
+        if content_qty and content_qty > 0 and content_pid ~= "" and content_pid ~= "None" then
+            extra_parts = extra_parts
+                .. string.format(',"RemainingFillCharges":%d', content_qty)
+                .. string.format(',"ContentItemData":"%s"', content_pid)
+        elseif content_qty and content_qty > 0 then
+            log_err("serialize: container has " .. content_qty
+                .. " charges but unknown content type — contents NOT saved (will restore empty).")
         end
 
         local json_idx = i - 1
@@ -1022,9 +1052,10 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
                 if dur then frag = frag .. string.format(',"Durability":%d', dur) end
                 local vsh = tonumber(rec.VitalShield)
                 if vsh then frag = frag .. string.format(',"VitalShield":%g', vsh) end
+                -- Paired or nothing (see serializer note).
                 local rfc = tonumber(rec.RemainingFillCharges)
-                if rfc then frag = frag .. string.format(',"RemainingFillCharges":%d', rfc) end
-                if rec.ContentItemData and rec.ContentItemData ~= "" then
+                if rfc and rfc > 0 and rec.ContentItemData and rec.ContentItemData ~= "" then
+                    frag = frag .. string.format(',"RemainingFillCharges":%d', rfc)
                     frag = frag .. string.format(',"ContentItemData":"%s"',
                         tostring(rec.ContentItemData):gsub('"', '\\"'))
                 end
@@ -1595,6 +1626,13 @@ local function register_save_hooks()
     log("Harvest hook " .. (ok_h and "registered." or "NOT available."))
 end
 
+-- Register hooks as early as possible: the menu controller exists at the main
+-- menu, BEFORE any world load — so the harvest/save hooks are live before the
+-- game sends the character-load RPC (in-world registration was too late).
+NotifyOnNewObject("/Script/Dominion.DominionPlayerControllerMenu", function(_)
+    ExecuteInGameThread(register_save_hooks)
+end)
+
 -- -----------------------------------------------------------------------------
 -- Load-time restore (runs on EVERY world load)
 -- NotifyOnNewObject(DominionPlayerController) fires on each world entry — incl.
@@ -1675,6 +1713,10 @@ local function start_load_restore()
                 done = true
                 LoadedFromDisk[guid] = true
                 ControllersByGuid[guid] = ctrl
+
+                -- Refresh the content-type cache from the game's own save
+                -- before restoring (covers container fill types).
+                pcall(harvest_from_disk)
 
                 local saved = load_inventory_data(guid)
                 if not saved then

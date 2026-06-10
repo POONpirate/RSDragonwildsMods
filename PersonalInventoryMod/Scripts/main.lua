@@ -319,40 +319,42 @@ end
 local function find_ufunction(cls, fname)
     local target = nil
     local depth = 0
+    local last_err = nil
     while cls and depth < 6 do
-        pcall(function()
+        local ok_fe, fe_err = pcall(function()
             cls:ForEachFunction(function(fn)
                 local n = ""
                 pcall(function() n = fn:GetFName():ToString() end)
                 if n == fname then
                     target = fn
-                    return true  -- early-out if supported
                 end
             end)
         end)
+        if not ok_fe then last_err = fe_err end
         if target then return target end
         local ok_su, su = pcall(function() return cls:GetSuperStruct() end)
         if not (ok_su and su) then break end
         cls = su
         depth = depth + 1
     end
-    return nil
+    return nil, last_err
 end
 
 -- Reflect a UFunction's parameter list: { {name=..., type=...}, ... }.
 -- UFunction params (incl. out/return) are properties on the function object.
-local UFN_PARAM_CACHE = {}
+local UFN_PARAM_CACHE = {}  -- successes only — a failure in one context (e.g.
+                            -- StaticFindObject class wrapper) must not poison
+                            -- later attempts with a real instance class.
 local function get_ufunction_params(cls, fname)
-    if UFN_PARAM_CACHE[fname] ~= nil then
-        return UFN_PARAM_CACHE[fname] or nil  -- false caches a failed lookup
-    end
-    local fn = find_ufunction(cls, fname)
+    if UFN_PARAM_CACHE[fname] then return UFN_PARAM_CACHE[fname] end
+    local fn, find_err = find_ufunction(cls, fname)
     if not fn then
-        UFN_PARAM_CACHE[fname] = false
+        log("reflect: " .. fname .. " not found"
+            .. (find_err and (" (ForEachFunction err: " .. tostring(find_err):sub(-80) .. ")") or ""))
         return nil
     end
     local params = {}
-    local ok_fe = pcall(function()
+    local ok_fe, fe_err = pcall(function()
         fn:ForEachProperty(function(prop)
             local nm, ty = "?", "?"
             pcall(function() nm = prop:GetFName():ToString() end)
@@ -361,7 +363,7 @@ local function get_ufunction_params(cls, fname)
         end)
     end)
     if not ok_fe then
-        UFN_PARAM_CACHE[fname] = false
+        log("reflect: " .. fname .. " ForEachProperty err: " .. tostring(fe_err):sub(-80))
         return nil
     end
     UFN_PARAM_CACHE[fname] = params
@@ -454,6 +456,7 @@ end
 local _probe_cast = 0
 local _dumped_item_props = false  -- one-shot full property dump of an ItemData asset
 local _dumped_comp_fns   = false  -- one-shot UFunction dump of PersonalInventoryComponent
+local _dumped_fparams    = false  -- one-shot add-function signature dump (live class)
 local function probe_slot(sv, label)
     -- GetPropertyValue pass: try reading each known field name.
     local names = { "GUID", "ItemData", "Count", "ItemId", "ItemClass",
@@ -1096,6 +1099,28 @@ local function restore_inventory(guid, comp, restore_json)
     -- Make sure AllowAdds isn't blocking the engine add functions.
     pcall(function() comp:SetPropertyValue("AllowAdds", true) end)
 
+    -- One-shot signature dump using the LIVE component's class — the same
+    -- context FNDUMP succeeded in. (StaticFindObject class wrappers don't
+    -- expose ForEachFunction in this build; run-7 proved that.)
+    if not _dumped_fparams then
+        _dumped_fparams = true
+        local ok_cc, cc = pcall(function() return comp:GetClass() end)
+        if ok_cc and cc then
+            for _, fname in ipairs({
+                "AddItem", "AddItems", "AddItemByData", "AddItemsByData",
+                "AddItemByDataToSlot", "AddItemToSlot", "RemoveFromSlot",
+                "GetItemFromSlot", "CanAddItemByData",
+            }) do
+                local params = get_ufunction_params(cc, fname)
+                if params then
+                    local sig = {}
+                    for _, p in ipairs(params) do sig[#sig + 1] = p.name .. ":" .. p.type end
+                    log("FPARAM " .. fname .. "(" .. table.concat(sig, ", ") .. ")")
+                end
+            end
+        end
+    end
+
     -- 2. Fallback: any slot the engine didn't fill gets restored through the
     --    engine's own add functions.
     for key, slot_data in pairs(parsed or {}) do
@@ -1596,28 +1621,6 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
         else
             hook_registered = true
             log("All hooks registered. Waiting for Eye of Oculus cast.")
-        end
-
-        -- One-shot dump of the add/remove function signatures (param names+types)
-        -- so the auto-arg builder's choices can be validated from the log.
-        local ok_invcls, invcls = pcall(StaticFindObject, "/Script/Dominion.InventoryComponent")
-        if ok_invcls and invcls and invcls:IsValid() then
-            for _, fname in ipairs({
-                "AddItem", "AddItems", "AddItemByData", "AddItemsByData",
-                "AddItemByDataToSlot", "AddItemToSlot", "RemoveFromSlot",
-                "GetItemFromSlot", "CanAddItemByData",
-            }) do
-                local params = get_ufunction_params(invcls, fname)
-                if params then
-                    local sig = {}
-                    for _, p in ipairs(params) do sig[#sig + 1] = p.name .. ":" .. p.type end
-                    log("FPARAM " .. fname .. "(" .. table.concat(sig, ", ") .. ")")
-                else
-                    log("FPARAM " .. fname .. ": reflection failed")
-                end
-            end
-        else
-            log_err("FPARAM: InventoryComponent class not found via StaticFindObject.")
         end
 
         -- -----------------------------------------------------------------------

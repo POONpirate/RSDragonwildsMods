@@ -425,6 +425,21 @@ local function call_inventory_fn(comp, fname, item_obj, slot_idx, count, guid_he
     return ok_call, ret
 end
 
+-- Class check for container items (buckets, watering cans). Property-presence
+-- probing is unreliable (nonexistent properties return garbage userdata), so
+-- gate container handling on IsA instead.
+local _container_item_class = nil
+local function is_container_item(obj)
+    if _container_item_class == nil then
+        local ok_c, c = pcall(StaticFindObject, "/Script/Dominion.HeldContainerEquipmentItem")
+        _container_item_class = (ok_c and c and c:IsValid()) and c or false
+    end
+    if not _container_item_class then return false end
+    local res = false
+    pcall(function() res = obj:IsA(_container_item_class) end)
+    return res == true
+end
+
 -- Read an asset's PersistenceID as the b64 string the save format expects.
 local function get_persistence_id(asset)
     local ok_pid, pv = pcall(function() return asset:GetPropertyValue("PersistenceID") end)
@@ -433,6 +448,84 @@ local function get_persistence_id(asset)
     local s = ""
     pcall(function() s = tostring(pv:ToString()) end)
     return s
+end
+
+-- ---------------------------------------------------------------------------
+-- Content-attribute cache
+-- Container content TYPES can't be read off live items (the ObjectProperty-in-
+-- struct read hard-crashes UE4SS) and the persistence mirror fields are stale.
+-- Instead we harvest GUID → ContentItemData pairs from the game's OWN character
+-- save JSON (handed to us by the Server_ReceiveLoadFromDisk hook) and persist
+-- them in a cache file across sessions.
+-- ---------------------------------------------------------------------------
+local ContentAttrCache  = {}   -- item GUID (b64) → { ContentItemData=..., RemainingFillCharges=... }
+local _attr_cache_loaded = false
+
+local function attrs_cache_path()
+    return get_save_dir() .. MOD_NAME .. "_ContentAttrs.json"
+end
+
+local function load_attr_cache()
+    if _attr_cache_loaded then return end
+    _attr_cache_loaded = true
+    local f = io.open(attrs_cache_path(), "r")
+    if not f then return end
+    local c = f:read("*a")
+    f:close()
+    local ok, t = pcall(json.decode, c)
+    if ok and type(t) == "table" then
+        ContentAttrCache = t
+        local n = 0
+        for _ in pairs(t) do n = n + 1 end
+        log("Content-attr cache loaded (" .. n .. " entries).")
+    end
+end
+
+local function save_attr_cache()
+    local parts = {}
+    for g, a in pairs(ContentAttrCache) do
+        if type(a) == "table" and a.ContentItemData then
+            parts[#parts + 1] = string.format(
+                '%s"%s":{"ContentItemData":"%s"%s}',
+                (#parts > 0 and "," or ""), g, tostring(a.ContentItemData),
+                a.RemainingFillCharges
+                    and (',"RemainingFillCharges":' .. tostring(a.RemainingFillCharges)) or "")
+        end
+    end
+    local f = io.open(attrs_cache_path(), "w")
+    if f then
+        f:write("{" .. table.concat(parts) .. "}")
+        f:close()
+    end
+end
+
+-- Mine an engine character-save JSON string for content attributes.
+local function harvest_content_attrs(content_json)
+    load_attr_cache()
+    local ok, t = pcall(json.decode, content_json)
+    if not ok or type(t) ~= "table" then
+        log("harvest: could not parse character save JSON: " .. tostring(t):sub(1, 80))
+        return
+    end
+    local found = 0
+    for _, v in pairs(t) do
+        if type(v) == "table" then
+            for k2, entry in pairs(v) do
+                if tonumber(k2) and type(entry) == "table"
+                   and entry.GUID and entry.ContentItemData then
+                    ContentAttrCache[entry.GUID] = {
+                        ContentItemData = entry.ContentItemData,
+                        RemainingFillCharges = entry.RemainingFillCharges,
+                    }
+                    found = found + 1
+                end
+            end
+        end
+    end
+    if found > 0 then
+        save_attr_cache()
+        log("harvest: cached content attrs for " .. found .. " item(s) from engine save.")
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -547,9 +640,11 @@ local function serialize_item_slots(inv_comp)
         return nil
     end
 
-    -- 2. Probe a few slots with detailed field inspection (every other cast).
+    -- 2. Probe a few slots with detailed field inspection.
+    -- DISABLED: served its purpose during format discovery; pure log noise now.
+    local PROBES_ENABLED = false
     _probe_cast = _probe_cast + 1
-    if _probe_cast <= 5 then
+    if PROBES_ENABLED and _probe_cast <= 5 then
         local ok_1, s1 = pcall(function() return sv[1] end)
         if ok_1 and s1 then probe_slot(s1, "probe sv[1]") end
         -- Also probe index 2 in case slot 1 is our seeded empty entry.
@@ -577,10 +672,8 @@ local function serialize_item_slots(inv_comp)
         if guid_str == "" or guid_str == EMPTY_GUID then goto continue end
 
         -- Deep probe this occupied slot's ItemData with exhaustive method + field sweep.
-        -- IsValid()=true for occupied slots but GetPathName/GetClass fail (it's an FStruct,
-        -- not a real UObject).  Sweep every plausible method and sub-field to find the
-        -- string form of the item type reference.
-        if _probe_cast <= 5 then
+        -- DISABLED: discovery-era diagnostic, pure log noise now.
+        if PROBES_ENABLED and _probe_cast <= 5 then
             local ok_dp, dp = pcall(function() return slot:GetPropertyValue("ItemData") end)
             if ok_dp and dp ~= nil then
                 log("=== ItemData sweep for occupied slot " .. (i-1) .. " ===")
@@ -745,45 +838,91 @@ local function serialize_item_slots(inv_comp)
         -- (UHeldContainerEquipmentItem.Contents → RemainingFillCharges +
         -- ContentItemData). Properties absent on other item classes simply
         -- fail the pcall reads and are skipped.
+        -- NOTE on crash safety (run-14): pcall does NOT catch native access
+        -- violations. Reading the live Contents struct proxy crashed the game
+        -- when a container was in the chest, so: read the plain mirror fields
+        -- (FString/int32 — safe property types) FIRST, and only touch the live
+        -- struct when the mirrors yield nothing. Breadcrumb logs (flushed per
+        -- line) bracket each read so any future crash pinpoints the access.
         local extra_parts = ""
+        write_mod_log("serialize: extras begin slot " .. (i - 1))
         local ok_vs, vs = pcall(function()
             return tonumber(slot:GetPropertyValue("CurrentVitalShield"))
         end)
         if ok_vs and vs then
             extra_parts = extra_parts .. string.format(',"VitalShield":%g', vs)
         end
+        write_mod_log("serialize: extras vitalshield done")
 
         local content_pid, content_qty = "", nil
-        local ok_ct, ct = pcall(function() return slot:GetPropertyValue("Contents") end)
-        if ok_ct and ct ~= nil then
-            local ok_cd, cd = pcall(function() return ct:GetPropertyValue("ContentData") end)
-            if not (ok_cd and cd ~= nil) then
-                ok_cd, cd = pcall(function() return ct.ContentData end)
+        if is_container_item(slot) then
+            -- Quantity: LIVE struct POD read — struct-proxy POD reads are safe
+            -- (every FGuid read proves it). NEVER read ContentData (object ptr)
+            -- from the struct proxy: that exact access hard-crashes UE4SS
+            -- (run-15 dump: AV at 0xFFFFFFFFFFFFFFFF inside UE4SS.dll).
+            write_mod_log("serialize: extras live Quantity read begin")
+            local ok_ct, ct = pcall(function() return slot:GetPropertyValue("Contents") end)
+            if ok_ct and ct ~= nil then
+                local ok_q, q = pcall(function() return tonumber(ct:GetPropertyValue("Quantity")) end)
+                if ok_q and q then content_qty = q end
             end
-            if ok_cd and cd ~= nil then
-                local ok_iv, iv = pcall(function() return cd:IsValid() end)
-                if ok_iv and iv then content_pid = get_persistence_id(cd) end
+            write_mod_log("serialize: extras live Quantity done (" .. tostring(content_qty) .. ")")
+            -- Mirror fallback for quantity (plain int property).
+            if not content_qty then
+                local ok_qp, qp = pcall(function()
+                    return tonumber(slot:GetPropertyValue("Quantity_Persistence"))
+                end)
+                if ok_qp and qp then content_qty = qp end
             end
-            local ok_q, q = pcall(function() return tonumber(ct:GetPropertyValue("Quantity")) end)
-            if not (ok_q and q) then
-                ok_q, q = pcall(function() return tonumber(ct.Quantity) end)
-            end
-            if ok_q and q then content_qty = q end
-        end
-        -- Fallback: the item's persistence mirror fields.
-        if content_pid == "" then
+
+            -- Content TYPE: mirror string first (plain FString property)...
             local ok_cp, cp = pcall(function() return slot:GetPropertyValue("ContentPersistenceID") end)
             if ok_cp and cp ~= nil then
                 if type(cp) == "string" then content_pid = cp
                 else pcall(function() content_pid = tostring(cp:ToString()) end) end
+                if content_pid == "None" then content_pid = "" end
+            end
+            write_mod_log("serialize: extras mirror pid done (" .. tostring(content_pid) .. ")")
+            -- ...then the harvested attr cache (engine save data, keyed by the
+            -- item's instance GUID — same GUID in both inventories)...
+            if content_pid == "" then
+                load_attr_cache()
+                local b64g = guid_hex_to_b64(guid_str)
+                local cached = b64g and ContentAttrCache[b64g]
+                if cached and cached.ContentItemData then
+                    content_pid = tostring(cached.ContentItemData)
+                    log("serialize: content type from attr cache: " .. content_pid)
+                end
+            end
+            -- ...then infer from the asset's AllowedFillTypes when unambiguous
+            -- (TArray object-element access is safe — ItemSlots proves it).
+            if content_pid == "" and content_qty and content_qty > 0
+               and ok_d and dv ~= nil and type(dv) ~= "string" then
+                write_mod_log("serialize: extras AllowedFillTypes inference begin")
+                local ok_af, af = pcall(function() return dv:GetPropertyValue("AllowedFillTypes") end)
+                if ok_af and af ~= nil then
+                    local first, n_valid = nil, 0
+                    for k = 1, 8 do
+                        local ok_e, e = pcall(function() return af[k] end)
+                        if not (ok_e and e ~= nil) then break end
+                        local ok_iv, iv = pcall(function() return e:IsValid() end)
+                        if ok_iv and iv then
+                            n_valid = n_valid + 1
+                            if not first then first = e end
+                        end
+                    end
+                    if n_valid == 1 and first then
+                        content_pid = get_persistence_id(first)
+                        log("serialize: content type inferred from AllowedFillTypes: " .. content_pid)
+                    elseif n_valid > 1 then
+                        log_err("serialize: container content type ambiguous ("
+                            .. n_valid .. " allowed types) — type not saved, quantity kept.")
+                    end
+                end
+                write_mod_log("serialize: extras AllowedFillTypes inference done")
             end
         end
-        if not content_qty then
-            local ok_qp, qp = pcall(function()
-                return tonumber(slot:GetPropertyValue("Quantity_Persistence"))
-            end)
-            if ok_qp and qp then content_qty = qp end
-        end
+        write_mod_log("serialize: extras done slot " .. (i - 1))
         if content_qty then
             extra_parts = extra_parts .. string.format(',"RemainingFillCharges":%d', content_qty)
         end
@@ -1330,6 +1469,18 @@ local function restore_inventory(guid, comp, restore_json)
                 local fill_qty = tonumber(slot_data.RemainingFillCharges)
                 local content_id = slot_data.ContentItemData
                 if fill_qty or (content_id and content_id ~= "") then
+                    -- Crash-safety: breadcrumb each step (run-14 showed struct
+                    -- proxy access can hard-crash; pcall can't catch that).
+                    write_mod_log("restore: contents begin slot " .. idx)
+                    -- Cache fallback: older saves may lack ContentItemData.
+                    if not content_id or content_id == "" then
+                        load_attr_cache()
+                        local cached = slot_data.GUID and ContentAttrCache[slot_data.GUID]
+                        if cached and cached.ContentItemData then
+                            content_id = tostring(cached.ContentItemData)
+                            log("restore: slot " .. idx .. " content type from attr cache.")
+                        end
+                    end
                     local content_obj = nil
                     if content_id and content_id ~= "" then
                         content_obj = find_item_by_persistence_id(content_id)
@@ -1338,44 +1489,42 @@ local function restore_inventory(guid, comp, restore_json)
                                 .. tostring(content_id))
                         end
                     end
-                    -- Attempt 1: whole-struct write from a table.
-                    local ok_cw = pcall(function()
-                        it:SetPropertyValue("Contents", {
-                            ContentData = content_obj,
-                            Quantity    = fill_qty or 0,
-                        })
-                    end)
-                    -- Verify; fall back to field-level writes on the struct proxy.
-                    local function read_qty()
-                        local ok_ct, ct = pcall(function() return it:GetPropertyValue("Contents") end)
-                        if not (ok_ct and ct) then return nil end
-                        local ok_q, q = pcall(function() return tonumber(ct:GetPropertyValue("Quantity")) end)
-                        if ok_q and q then return q end
-                        local ok_q2, q2 = pcall(function() return tonumber(ct.Quantity) end)
-                        return ok_q2 and q2 or nil
+                    -- CRASH GUARD: charges with a null content type render a
+                    -- broken fill bar and hard-crash the UI (run-16). If the
+                    -- content can't be resolved, restore the container EMPTY.
+                    if fill_qty and fill_qty > 0 and not content_obj then
+                        log_err("restore: slot " .. idx .. " has " .. fill_qty
+                            .. " charges but unresolvable content — restoring EMPTY to avoid crash.")
+                        fill_qty = 0
                     end
-                    if fill_qty and read_qty() ~= fill_qty then
-                        local ok_ct, ct = pcall(function() return it:GetPropertyValue("Contents") end)
-                        if ok_ct and ct then
-                            pcall(function() ct.Quantity = fill_qty end)
-                            pcall(function() ct:SetPropertyValue("Quantity", fill_qty) end)
-                            if content_obj then
-                                pcall(function() ct.ContentData = content_obj end)
-                                pcall(function() ct:SetPropertyValue("ContentData", content_obj) end)
-                            end
-                        end
-                    end
-                    -- Keep the persistence mirror fields in sync as well.
+                    -- 1. Persistence mirror fields first (safe plain properties).
                     if content_id and content_id ~= "" then
                         pcall(function() it:SetPropertyValue("ContentPersistenceID", content_id) end)
                     end
                     if fill_qty then
                         pcall(function() it:SetPropertyValue("Quantity_Persistence", fill_qty) end)
                     end
+                    write_mod_log("restore: contents mirrors written slot " .. idx)
+                    -- 2. Live struct write (whole-struct table assignment).
+                    local ok_cw = pcall(function()
+                        it:SetPropertyValue("Contents", {
+                            ContentData = content_obj,
+                            Quantity    = fill_qty or 0,
+                        })
+                    end)
+                    write_mod_log("restore: contents struct-write done (ok=" .. tostring(ok_cw) .. ")")
+                    -- 3. Verify via a guarded read.
+                    local qty_back = nil
+                    local ok_ct, ct = pcall(function() return it:GetPropertyValue("Contents") end)
+                    if ok_ct and ct then
+                        local ok_q, q = pcall(function() return tonumber(ct:GetPropertyValue("Quantity")) end)
+                        if ok_q and q then qty_back = q end
+                    end
+                    write_mod_log("restore: contents verify done slot " .. idx)
                     pcall(function() it:OnRep_Contents() end)
                     log(string.format(
                         "restore: slot %d contents — struct-write ok=%s qty-readback=%s content=%s",
-                        idx, tostring(ok_cw), tostring(read_qty()),
+                        idx, tostring(ok_cw), tostring(qty_back),
                         tostring(content_obj ~= nil)))
                 end
             end
@@ -1423,6 +1572,27 @@ local function register_save_hooks()
             log("Save hook NOT available: " .. hook_path)
         end
     end
+
+    -- Harvest hook: on character load the game hands over its full save JSON
+    -- (plain FString param) — mine it for container content types.
+    local ok_h = pcall(function()
+        RegisterHook("/Script/Dominion.DominionPlayerControllerBase:Server_ReceiveLoadFromDisk",
+            function(self, handle, bsuccess, slotinfo, content)
+                local s = nil
+                local ok_c, cv = pcall(function() return content:get() end)
+                if ok_c and cv ~= nil then
+                    if type(cv) == "string" then s = cv
+                    else pcall(function() s = tostring(cv:ToString()) end) end
+                end
+                if s and #s > 2 then
+                    log("harvest: received character save content (" .. #s .. " bytes).")
+                    pcall(harvest_content_attrs, s)
+                end
+            end,
+            function() end
+        )
+    end)
+    log("Harvest hook " .. (ok_h and "registered." or "NOT available."))
 end
 
 -- -----------------------------------------------------------------------------

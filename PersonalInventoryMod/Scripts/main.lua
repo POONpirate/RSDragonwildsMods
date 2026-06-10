@@ -301,6 +301,78 @@ local function find_item_by_persistence_id(pid)
     return nil
 end
 
+-- Accept either a 32-hex or base64url GUID string; return 32-hex (or nil).
+local function guid_any_to_hex(s)
+    if type(s) ~= "string" then return nil end
+    local n = norm_guid_hex(s)
+    if #n == 32 and n:match("^[0-9A-F]+$") then return n end
+    local raw = b64url_decode(s)
+    if raw and #raw == 16 then
+        return (raw:gsub(".", function(c) return string.format("%02X", c:byte()) end))
+    end
+    return nil
+end
+
+-- Reflect a UFunction's parameter list: { {name=..., type=...}, ... }.
+-- UFunction params (incl. out/return) are properties on the function object.
+local function get_ufunction_params(fn_path)
+    local ok_fn, fn = pcall(StaticFindObject, fn_path)
+    if not ok_fn or not fn or not fn:IsValid() then return nil end
+    local params = {}
+    local ok_fe = pcall(function()
+        fn:ForEachProperty(function(prop)
+            local nm, ty = "?", "?"
+            pcall(function() nm = prop:GetFName():ToString() end)
+            pcall(function() ty = prop:GetClass():GetFName():ToString() end)
+            params[#params + 1] = { name = nm, type = ty }
+        end)
+    end)
+    if not ok_fe then return nil end
+    return params
+end
+
+-- Call an InventoryComponent add-function with auto-built args based on the
+-- reflected parameter list. Heuristics: ObjectProperty→item asset,
+-- "slot"→slot index, "count"/"num"/"amount"→count, StructProperty→FGuid table,
+-- BoolProperty→true, everything else→zero values. ReturnValue is skipped.
+local function call_inventory_fn(comp, fname, item_obj, slot_idx, count, guid_hex)
+    local params = get_ufunction_params("/Script/Dominion.InventoryComponent:" .. fname)
+    if not params then return false, "reflection unavailable" end
+    local args, desc = {}, {}
+    for _, p in ipairs(params) do
+        local n = p.name:lower()
+        if n ~= "returnvalue" then
+            local t, v = p.type, nil
+            if t:find("ObjectProperty") then v = item_obj
+            elseif n:find("slot") or n:find("index") then v = slot_idx
+            elseif n:find("count") or n:find("num") or n:find("amount") or n:find("quantity") then v = count
+            elseif t == "IntProperty" or t:find("Int") then v = count
+            elseif t == "BoolProperty" then v = true
+            elseif t == "StructProperty" then
+                if guid_hex and #guid_hex == 32 then
+                    v = {
+                        A = tonumber(guid_hex:sub(1, 8), 16),
+                        B = tonumber(guid_hex:sub(9, 16), 16),
+                        C = tonumber(guid_hex:sub(17, 24), 16),
+                        D = tonumber(guid_hex:sub(25, 32), 16),
+                    }
+                else
+                    v = {}
+                end
+            elseif t:find("Float") or t:find("Double") then v = 0.0
+            elseif t:find("Str") or t:find("Name") or t:find("Text") then v = ""
+            else v = 0 end
+            args[#args + 1] = v
+            desc[#desc + 1] = p.name .. "(" .. t .. ")=" .. tostring(v):sub(1, 24)
+        end
+    end
+    log("call: " .. fname .. " args: " .. table.concat(desc, ", "))
+    local ok_call, ret = pcall(function()
+        return comp[fname](comp, table.unpack(args))
+    end)
+    return ok_call, ret
+end
+
 -- Read an asset's PersistenceID as the b64 string the save format expects.
 local function get_persistence_id(asset)
     local ok_pid, pv = pcall(function() return asset:GetPropertyValue("PersistenceID") end)
@@ -1027,22 +1099,16 @@ local function restore_inventory(guid, comp, restore_json)
                 goto next_slot
             end
 
-            -- Engine-native add. Signature unknown — try likely arg orders and
-            -- verify by re-scanning slot occupancy after each call.
+            -- Engine-native add with reflected signatures (run-5 showed
+            -- AddItemByDataToSlot wants 6 params, AddItemByData wants 5 —
+            -- args are auto-built from the UFunction's parameter list).
             local cnt = tonumber(slot_data.Count) or 1
-            local attempts = {
-                { "AddItemByDataToSlot", { found, idx, cnt } },
-                { "AddItemByDataToSlot", { found, cnt, idx } },
-                { "AddItemByData",       { found, cnt } },
-            }
+            local ghex = guid_any_to_hex(slot_data.GUID)
             local added = false
-            for _, att in ipairs(attempts) do
-                local fname, args = att[1], att[2]
-                local ok_call, ret = pcall(function()
-                    return comp[fname](comp, table.unpack(args))
-                end)
-                log(string.format("restore: slot %d %s(#%d args) ok=%s ret=%s",
-                    idx, fname, #args, tostring(ok_call), tostring(ret)))
+            for _, fname in ipairs({ "AddItemByDataToSlot", "AddItemByData", "AddItemToSlot" }) do
+                local ok_call, ret = call_inventory_fn(comp, fname, found, idx, cnt, ghex)
+                log(string.format("restore: slot %d %s ok=%s ret=%s",
+                    idx, fname, tostring(ok_call), tostring(ret):sub(1, 160)))
                 local now_set = scan_occupied_slots(comp)
                 if now_set[idx] then
                     added = true
@@ -1491,6 +1557,23 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
         else
             hook_registered = true
             log("All hooks registered. Waiting for Eye of Oculus cast.")
+        end
+
+        -- One-shot dump of the add/remove function signatures (param names+types)
+        -- so the auto-arg builder's choices can be validated from the log.
+        for _, fname in ipairs({
+            "AddItem", "AddItems", "AddItemByData", "AddItemsByData",
+            "AddItemByDataToSlot", "AddItemToSlot", "RemoveFromSlot",
+            "GetItemFromSlot", "CanAddItemByData",
+        }) do
+            local params = get_ufunction_params("/Script/Dominion.InventoryComponent:" .. fname)
+            if params then
+                local sig = {}
+                for _, p in ipairs(params) do sig[#sig + 1] = p.name .. ":" .. p.type end
+                log("FPARAM " .. fname .. "(" .. table.concat(sig, ", ") .. ")")
+            else
+                log("FPARAM " .. fname .. ": reflection failed")
+            end
         end
 
         -- -----------------------------------------------------------------------

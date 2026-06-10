@@ -19,12 +19,12 @@ local SECOND_INV_SLOTS = 40
 local SPELL_HOOK = "/Game/Gameplay/GameplayEffects/PerksV2/GE_PerkV2_Construction_Oculus.GE_PerkV2_Construction_Oculus_C:OnGameplayEffectAdded"
 
 local GAME_SAVE_HOOKS = {
-    "/Script/Dominion.DominionPlayerController:ServerSaveCharacter",
-    "/Script/Dominion.DominionPlayerController:SaveCharacter",
-    "/Script/Dominion.DominionPlayerController:SaveGame",
-    "/Script/Dominion.DominionGameMode:SaveGame",
-    "/Script/Dominion.DominionGameMode:AutoSave",
-    "/Script/Dominion.DominionGameMode:SaveWorld",
+    -- Client_SaveToDisk is the RPC the game uses to write the character save
+    -- (CharacterSave incl. PersonalInventory) to disk — confirmed in the CXX
+    -- header dump. Hooking it keeps our JSON snapshot in lock-step with the
+    -- game's own save moments, preventing item dupes/losses from out-of-sync
+    -- writes. (SaveGameToSlot registers but never fires in this game.)
+    "/Script/Dominion.DominionPlayerController:Client_SaveToDisk",
     "/Script/Engine.GameplayStatics:SaveGameToSlot",
 }
 
@@ -66,6 +66,9 @@ local ControllersByGuid   = {}  -- guid → ctrl  (kept for open/save calls)
 local CachedInventoryJson = {}  -- guid → json string (captured from component between casts)
 local LoadedFromDisk      = {}  -- guid → true once disk save has been restored this session
 local PendingRestoreData  = {}  -- guid → json string; consumed by OPI post-hook after OpenPersonalInventory runs
+local FailedRestoreSlots  = {}  -- guid → { [slot_key] = {GUID,ItemData,Count,Durability,Path} }
+                                -- slots whose item couldn't be restored this session; preserved
+                                -- in every save so the item is never silently deleted
 
 -- -----------------------------------------------------------------------------
 -- Logging helpers
@@ -816,8 +819,42 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
     end
 
     if not to_write then
+        -- Note: when empty, the existing file is left untouched — so any
+        -- unrestored items recorded for this guid survive in the old file.
         log("save: inventory is empty — nothing written for GUID " .. guid)
         return nil
+    end
+
+    -- Preserve unrestored slots: merge them into the outgoing JSON so items
+    -- that failed to restore this session are never dropped from the save.
+    local failed = FailedRestoreSlots[guid]
+    if failed and next(failed) then
+        for key, rec in pairs(failed) do
+            if to_write:find('"' .. key .. '":', 1, true) then
+                log_err("save: slot " .. key .. " has live data AND an unrestored item — keeping live; dropped: "
+                    .. tostring(rec.ItemData))
+            else
+                local frag = string.format(',"%s":{"GUID":"%s","ItemData":"%s","Count":%d',
+                    key, tostring(rec.GUID), tostring(rec.ItemData):gsub('"', '\\"'),
+                    tonumber(rec.Count) or 1)
+                local dur = tonumber(rec.Durability)
+                if dur then frag = frag .. string.format(',"Durability":%d', dur) end
+                frag = frag .. "}"
+                local pos = to_write:find(',"MaxSlotIndex"', 1, true)
+                if pos then
+                    to_write = to_write:sub(1, pos - 1) .. frag .. to_write:sub(pos)
+                    log("save: preserved unrestored slot " .. key .. " in save file.")
+                else
+                    log_err("save: could not splice unrestored slot " .. key .. " (no MaxSlotIndex anchor).")
+                end
+                -- Carry the asset path forward in the sidecar too.
+                if rec.Path and rec.Path ~= "" then
+                    local inner = (sidecar_json or "{}"):sub(2, -2)
+                    local entry = string.format('"%s":"%s"', key, rec.Path:gsub('"', '\\"'))
+                    sidecar_json = "{" .. (inner ~= "" and (inner .. ",") or "") .. entry .. "}"
+                end
+            end
+        end
     end
 
     local path = json_path(guid)
@@ -1168,7 +1205,13 @@ local function restore_inventory(guid, comp, restore_json)
             end
             if not found then
                 log_err("restore: slot " .. idx .. ": cannot resolve item ("
-                    .. idat:sub(1, 60) .. ")")
+                    .. idat:sub(1, 60) .. ") — preserving in saves.")
+                FailedRestoreSlots[guid] = FailedRestoreSlots[guid] or {}
+                FailedRestoreSlots[guid][key] = {
+                    GUID = slot_data.GUID, ItemData = slot_data.ItemData,
+                    Count = slot_data.Count, Durability = slot_data.Durability,
+                    Path = path,
+                }
                 goto next_slot
             end
 
@@ -1186,7 +1229,13 @@ local function restore_inventory(guid, comp, restore_json)
 
             local now_set = scan_occupied_slots(comp)
             if not now_set[idx] then
-                log_err("restore: slot " .. idx .. " still empty after add.")
+                log_err("restore: slot " .. idx .. " still empty after add — preserving in saves.")
+                FailedRestoreSlots[guid] = FailedRestoreSlots[guid] or {}
+                FailedRestoreSlots[guid][key] = {
+                    GUID = slot_data.GUID, ItemData = slot_data.ItemData,
+                    Count = slot_data.Count, Durability = slot_data.Durability,
+                    Path = path,
+                }
                 goto next_slot
             end
             log("restore: slot " .. idx .. " now occupied.")
@@ -1680,8 +1729,12 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                             end
                         end
 
-                        -- Persist on every open so items are never lost between sessions.
-                        local current_json = save_inventory_data(guid, second_inv, CachedInventoryJson[guid])
+                        -- NO file write here: the JSON on disk must only change when the
+                        -- game itself saves (Client_SaveToDisk hook), so chest state and
+                        -- world state always snapshot the same moment — otherwise items
+                        -- can dupe or vanish if the session ends without a game save.
+                        -- Serialize in-memory only, for the JsonInventory sync below.
+                        local current_json = serialize_item_slots(second_inv)
 
                         -- Keep JsonInventory = full engine-format inventory (items + MaxSlotIndex:39).
                         -- If OpenPersonalInventory rebuilds ItemSlots from JsonInventory, this

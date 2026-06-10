@@ -156,7 +156,7 @@ local function read_fguid(gv)
     return ""
 end
 
--- Normalize any FGuid string form to bare upper-case 32-hex (strip dashes).
+-- Normalize an FGuid string form to bare upper-case 32-hex (strip dashes).
 local function norm_guid_hex(s)
     if type(s) ~= "string" then return "" end
     return (s:gsub("-", "")):upper()
@@ -273,6 +273,8 @@ end
 -- Slot-level probe (runs once per session after items might be present)
 -- ---------------------------------------------------------------------------
 local _probe_cast = 0
+local _dumped_item_props = false  -- one-shot full property dump of an ItemData asset
+local _dumped_comp_fns   = false  -- one-shot UFunction dump of PersonalInventoryComponent
 local function probe_slot(sv, label)
     -- GetPropertyValue pass: try reading each known field name.
     local names = { "GUID", "ItemData", "Count", "ItemId", "ItemClass",
@@ -871,6 +873,21 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                                     return comp:GetPropertyValue("ItemSlots")
                                 end)
                                 if ok_sv and sv then
+                                    -- Occupancy scan: did the engine's parser accept the JSON?
+                                    -- (Counts slots with a non-zero GUID right after the broadcast.)
+                                    local occupied = {}
+                                    for si = 1, SECOND_INV_SLOTS do
+                                        local ok_ssl, ssl = pcall(function() return sv[si] end)
+                                        if not (ok_ssl and ssl) then break end
+                                        local ok_sg, sg = pcall(function() return ssl:GetPropertyValue("GUID") end)
+                                        local shex = (ok_sg and sg) and norm_guid_hex(read_fguid(sg)) or ""
+                                        if shex ~= "" and shex ~= EMPTY_GUID then
+                                            occupied[#occupied + 1] = si - 1
+                                        end
+                                    end
+                                    log("OPI fix: occupied slots after broadcast = " .. #occupied
+                                        .. (#occupied > 0 and (" [" .. table.concat(occupied, ",") .. "]") or ""))
+
                                     local ok_dec, parsed = pcall(json.decode, restore_json)
                                     if not ok_dec then
                                         log_err("OPI fix: json.decode failed: " .. tostring(parsed))
@@ -881,6 +898,12 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                                         if idx and type(slot_data) == "table"
                                            and slot_data.GUID and slot_data.GUID ~= ""
                                            and norm_guid_hex(slot_data.GUID) ~= EMPTY_GUID then
+                                            -- Engine-format slots (base64url GUIDs, not 32-hex) are the
+                                            -- engine's job to restore — skip the manual write for those.
+                                            if not slot_data.GUID:match("^[0-9A-Fa-f]+$") or #slot_data.GUID ~= 32 then
+                                                log("OPI fix: slot " .. idx .. " is engine-format — left to engine.")
+                                                goto next_slot
+                                            end
                                             local i = idx + 1  -- sv[] is 1-based, JSON keys 0-based
                                             local ok_sl, sl = pcall(function() return sv[i] end)
                                             if not (ok_sl and sl) then
@@ -1145,6 +1168,42 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                                                     .. " (empty/layout only)")
                                             end
 
+                                            -- One-shot UFunction dump of the component class chain. Goal:
+                                            -- find the engine's own "serialize ItemSlots → JsonInventory"
+                                            -- function so we can call it on OUR component and get engine-
+                                            -- format JSON (incl. correct b64 ItemData GUIDs) for free.
+                                            if not _dumped_comp_fns then
+                                                _dumped_comp_fns = true
+                                                local ok_cls, cls = pcall(function() return pic:GetClass() end)
+                                                local depth = 0
+                                                while ok_cls and cls and depth < 4 do
+                                                    local cn = "?"
+                                                    pcall(function() cn = cls:GetFName():ToString() end)
+                                                    if cn == "ActorComponent" or cn == "Object" then break end
+                                                    local fns = {}
+                                                    local ok_fe, fe_err = pcall(function()
+                                                        cls:ForEachFunction(function(fn)
+                                                            local n = "?"
+                                                            pcall(function() n = fn:GetFName():ToString() end)
+                                                            fns[#fns + 1] = n
+                                                        end)
+                                                    end)
+                                                    if not ok_fe then
+                                                        log("FNDUMP ForEachFunction unavailable: " .. tostring(fe_err))
+                                                        break
+                                                    end
+                                                    -- Chunk output: 6 names per line.
+                                                    log("FNDUMP class [" .. cn .. "] " .. #fns .. " functions:")
+                                                    for ci = 1, #fns, 6 do
+                                                        log("FNDUMP   " .. table.concat(fns, ", ", ci, math.min(ci + 5, #fns)))
+                                                    end
+                                                    local ok_su, su = pcall(function() return cls:GetSuperStruct() end)
+                                                    if not (ok_su and su) then break end
+                                                    cls = su
+                                                    depth = depth + 1
+                                                end
+                                            end
+
                                             -- GUID-encoding spy: dump the real inventory's LIVE slots so we
                                             -- can match hex GUIDs/asset paths against the base64url values in
                                             -- CharacterSave.json's PersonalInventory table (offline analysis).
@@ -1174,6 +1233,55 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                                                         log(string.format("SPY real slot %d: GUID=%s Count=%s",
                                                             ri - 1, ghex, tostring(ok_rcnt and rcnt)))
                                                         log("SPY real slot " .. (ri - 1) .. ": ItemData=" .. path)
+                                                        -- One-shot FULL property dump of this ItemData asset via
+                                                        -- UE4SS reflection. Goal: find the property holding the
+                                                        -- 16-byte GUID the engine writes as b64 ItemData in saves
+                                                        -- (e.g. stone block = 8C41847A44CB69B7D3AAD58496A3572D).
+                                                        if not _dumped_item_props and ok_rd and rd then
+                                                            _dumped_item_props = true
+                                                            local ok_cls, cls = pcall(function() return rd:GetClass() end)
+                                                            local depth = 0
+                                                            while ok_cls and cls and depth < 8 do
+                                                                local cn = "?"
+                                                                pcall(function() cn = cls:GetFName():ToString() end)
+                                                                if cn == "Object" then break end
+                                                                log("PROPDUMP class [" .. cn .. "]:")
+                                                                local ok_fe, fe_err = pcall(function()
+                                                                    cls:ForEachProperty(function(prop)
+                                                                        local pn = "?"
+                                                                        pcall(function() pn = prop:GetFName():ToString() end)
+                                                                        local info = "unreadable"
+                                                                        local ok_v, v = pcall(function() return rd:GetPropertyValue(pn) end)
+                                                                        if ok_v and v ~= nil then
+                                                                            local t = type(v)
+                                                                            if t ~= "userdata" then
+                                                                                info = t .. " = " .. tostring(v):sub(1, 80)
+                                                                            else
+                                                                                local h = ""
+                                                                                pcall(function() h = norm_guid_hex(read_fguid(v)) end)
+                                                                                if #h == 32 then
+                                                                                    info = "FGUID = " .. h
+                                                                                else
+                                                                                    local ts = ""
+                                                                                    pcall(function() ts = tostring(v:ToString()) end)
+                                                                                    info = "userdata" .. (ts ~= "" and (" = " .. ts:sub(1, 80)) or "")
+                                                                                end
+                                                                            end
+                                                                        end
+                                                                        log("PROPDUMP   " .. pn .. " : " .. info)
+                                                                    end)
+                                                                end)
+                                                                if not ok_fe then
+                                                                    log("PROPDUMP ForEachProperty unavailable: " .. tostring(fe_err))
+                                                                    break
+                                                                end
+                                                                local ok_su, su = pcall(function() return cls:GetSuperStruct() end)
+                                                                if not (ok_su and su) then break end
+                                                                cls = su
+                                                                depth = depth + 1
+                                                            end
+                                                        end
+
                                                         -- Sweep the ItemData asset for GUID-like properties —
                                                         -- one of them should match the b64 ItemData in the save.
                                                         if ok_rd and rd then

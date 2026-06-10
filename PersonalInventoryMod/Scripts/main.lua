@@ -1295,6 +1295,111 @@ local function register_save_hooks()
 end
 
 -- -----------------------------------------------------------------------------
+-- Load-time restore (runs on EVERY world load)
+-- NotifyOnNewObject(DominionPlayerController) fires on each world entry — incl.
+-- re-entry after exit-to-main-menu, when the previous world's component is gone
+-- but our Lua state (LoadedFromDisk etc.) lingers. Detect that and re-restore.
+-- -----------------------------------------------------------------------------
+
+local load_restore_generation = 0
+
+local function find_second_inventory_in_world()
+    local ok_fa, all_pics = pcall(FindAllOf, "PersonalInventoryComponent")
+    if not ok_fa or not all_pics then return nil end
+    for _, pic in ipairs(all_pics) do
+        if pic:IsValid() then
+            local ok_nm, nm = pcall(function() return pic:GetName() end)
+            if ok_nm and nm and nm:find("SecondPersonalInventory") then return pic end
+        end
+    end
+    return nil
+end
+
+local function start_load_restore()
+    -- Generation counter: a newer call supersedes any still-polling loop.
+    load_restore_generation = load_restore_generation + 1
+    local gen = load_restore_generation
+    local done = false
+    local tries = 0
+    local ok_loop = pcall(function()
+        LoopAsync(2000, function()
+            if done or gen ~= load_restore_generation then return true end
+            tries = tries + 1
+            if tries > 30 then
+                log_err("Load-time restore: timed out waiting for character.")
+                return true
+            end
+            ExecuteInGameThread(function()
+                if done or gen ~= load_restore_generation then return end
+
+                local ctrl = find_local_controller()
+                if not ctrl then return end
+                local guid = resolve_character_guid(ctrl)
+                if not guid then return end
+
+                -- Wait for the player character — its presence means the save
+                -- data is loaded and components are safe to construct.
+                local char_ok = false
+                local ok_ch, chars = pcall(FindAllOf, "DominionPlayerCharacter")
+                if ok_ch and chars then
+                    for _, ch in ipairs(chars) do
+                        if ch:IsValid() then char_ok = true break end
+                    end
+                end
+                if not char_ok then return end
+
+                -- World re-entry detection: we restored earlier this mod
+                -- lifetime — but does that component still exist in THIS world?
+                if LoadedFromDisk[guid] then
+                    local comp = SecondInventories[guid]
+                    local ok_v, is_v = pcall(function() return comp and comp:IsValid() end)
+                    if ok_v and is_v then
+                        done = true  -- same world; nothing to do
+                        return
+                    end
+                    local found = find_second_inventory_in_world()
+                    if found then
+                        SecondInventories[guid] = found  -- stale Lua ref, live object
+                        done = true
+                        return
+                    end
+                    -- Component gone → fresh world instance → full re-restore.
+                    log("New world load detected — resetting session state for re-restore.")
+                    LoadedFromDisk[guid] = nil
+                    PendingRestoreData[guid] = nil
+                    FailedRestoreSlots[guid] = nil
+                    SecondInventories[guid] = nil
+                end
+
+                done = true
+                LoadedFromDisk[guid] = true
+                ControllersByGuid[guid] = ctrl
+
+                local saved = load_inventory_data(guid)
+                if not saved then
+                    log("Load-time restore: no save file — nothing to restore.")
+                    return
+                end
+
+                local comp = get_or_create_second_inventory(guid, ctrl)
+                if not comp then
+                    log_err("Load-time restore: component construction failed.")
+                    return
+                end
+
+                log("Load-time restore: populating second inventory from disk...")
+                restore_inventory(guid, comp, saved)
+                log("Load-time restore: complete.")
+            end)
+            return done
+        end)
+    end)
+    if not ok_loop then
+        log_err("LoopAsync unavailable — load-time restore will run on first cast instead.")
+    end
+end
+
+-- -----------------------------------------------------------------------------
 -- Eye of Oculus hook
 -- -----------------------------------------------------------------------------
 
@@ -1303,10 +1408,9 @@ log("Waiting for player controller to register Eye of Oculus hook...")
 local hook_registered = false
 
 NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
-    if hook_registered then return end
-
     ExecuteInGameThread(function()
-        if hook_registered then return end
+        -- Hooks register once; the load restore runs on EVERY controller spawn.
+        if not hook_registered then
 
         log("Player controller ready — registering hooks...")
 
@@ -1766,67 +1870,11 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
             log("All hooks registered. Waiting for Eye of Oculus cast.")
         end
 
-        -- -----------------------------------------------------------------------
-        -- Load-time restore
-        -- Populate the second inventory from the saved JSON as soon as the
-        -- character is fully loaded, then let the game manage it in memory.
-        -- Polls every 2s (up to 60s) until controller + character + GUID resolve.
-        -- -----------------------------------------------------------------------
-        local load_restore_done  = false
-        local load_restore_tries = 0
-        local ok_loop = pcall(function()
-            LoopAsync(2000, function()
-                if load_restore_done then return true end
-                load_restore_tries = load_restore_tries + 1
-                if load_restore_tries > 30 then
-                    log_err("Load-time restore: timed out waiting for character.")
-                    return true
-                end
-                ExecuteInGameThread(function()
-                    if load_restore_done then return end
+        end  -- if not hook_registered
 
-                    local ctrl = find_local_controller()
-                    if not ctrl then return end
-                    local guid = resolve_character_guid(ctrl)
-                    if not guid then return end
-
-                    -- Wait for the player character too — its presence means the
-                    -- save data is loaded and components are safe to construct.
-                    local char_ok = false
-                    local ok_ch, chars = pcall(FindAllOf, "DominionPlayerCharacter")
-                    if ok_ch and chars then
-                        for _, ch in ipairs(chars) do
-                            if ch:IsValid() then char_ok = true break end
-                        end
-                    end
-                    if not char_ok then return end
-
-                    load_restore_done = true
-                    if LoadedFromDisk[guid] then return end
-                    LoadedFromDisk[guid] = true
-                    ControllersByGuid[guid] = ctrl
-
-                    local saved = load_inventory_data(guid)
-                    if not saved then
-                        log("Load-time restore: no save file — nothing to restore.")
-                        return
-                    end
-
-                    local comp = get_or_create_second_inventory(guid, ctrl)
-                    if not comp then
-                        log_err("Load-time restore: component construction failed.")
-                        return
-                    end
-
-                    log("Load-time restore: populating second inventory from disk...")
-                    restore_inventory(guid, comp, saved)
-                    log("Load-time restore: complete.")
-                end)
-                return load_restore_done
-            end)
-        end)
-        if not ok_loop then
-            log_err("LoopAsync unavailable — load-time restore will run on first cast instead.")
-        end
+        -- Every controller spawn (= every world load, incl. re-entry from the
+        -- main menu) kicks off the load restore. start_load_restore detects
+        -- whether this is the same world (no-op) or a fresh one (re-restore).
+        start_load_restore()
     end)
 end)

@@ -24,7 +24,12 @@ local GAME_SAVE_HOOKS = {
     -- header dump. Hooking it keeps our JSON snapshot in lock-step with the
     -- game's own save moments, preventing item dupes/losses from out-of-sync
     -- writes. (SaveGameToSlot registers but never fires in this game.)
-    "/Script/Dominion.DominionPlayerController:Client_SaveToDisk",
+    -- NOTE: lives on DominionPlayerControllerBase (CXX dump line 8182), not
+    -- DominionPlayerController — the derived-class path fails to register.
+    "/Script/Dominion.DominionPlayerControllerBase:Client_SaveToDisk",
+    -- RequestGameExit fires when leaving via the pause menu (to main menu OR
+    -- desktop). Pre-hooked so the save lands before world teardown.
+    "/Script/Dominion.DominionNetworkSubsystem:RequestGameExit",
     "/Script/Engine.GameplayStatics:SaveGameToSlot",
 }
 
@@ -1278,18 +1283,33 @@ end
 -- Game-save hooks
 -- -----------------------------------------------------------------------------
 
-log("Registering game-save hooks...")
-for _, hook_path in ipairs(GAME_SAVE_HOOKS) do
-    local ok = pcall(function()
-        RegisterHook(hook_path,
-            function() end,
-            function()
-                log("Game save hook fired: " .. hook_path)
-                ExecuteInGameThread(save_all_inventories)
-            end
-        )
-    end)
-    if ok then log("Save hook registered: " .. hook_path) end
+-- Registration is DEFERRED to the controller-ready callback: at mod start the
+-- Dominion classes aren't loaded yet, so RegisterHook on them fails silently
+-- (run-10: only the Engine's SaveGameToSlot ever registered).
+local save_hooks_registered = false
+local function register_save_hooks()
+    if save_hooks_registered then return end
+    save_hooks_registered = true
+    log("Registering game-save hooks...")
+    for _, hook_path in ipairs(GAME_SAVE_HOOKS) do
+        local ok = pcall(function()
+            RegisterHook(hook_path,
+                function()
+                    -- PRE-hook, on the game thread: the save must complete before
+                    -- the hooked function runs — critical for RequestGameExit,
+                    -- where a post-hook would land after world teardown begins.
+                    log("Game save hook fired: " .. hook_path)
+                    pcall(save_all_inventories)
+                end,
+                function() end
+            )
+        end)
+        if ok then
+            log("Save hook registered: " .. hook_path)
+        else
+            log("Save hook NOT available: " .. hook_path)
+        end
+    end
 end
 
 -- -----------------------------------------------------------------------------
@@ -1307,6 +1327,9 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
         if hook_registered then return end
 
         log("Player controller ready — registering hooks...")
+
+        -- Game-save hooks need the Dominion classes loaded — register them here.
+        register_save_hooks()
 
         -- Post-hook on our second inventory's OpenPersonalInventory.
         -- OpenPersonalInventory likely rewrites JsonInventory from ItemSlots during its

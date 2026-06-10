@@ -289,6 +289,9 @@ end
 local ITEMDATA_CLASSES = {
     "ItemData", "HeldEquipmentData", "HeldContainerEquipmentData",
     "HarvestToolEquipmentData", "EquipmentData",
+    -- Container fill contents (compost, water, ...) — resolved for the
+    -- ContentItemData attribute of buckets / watering cans.
+    "ContainerContentDataAsset",
 }
 local function find_item_by_persistence_id(pid)
     if not pid or pid == "" then return nil end
@@ -737,17 +740,69 @@ local function serialize_item_slots(inv_comp)
             end
         end
 
+        -- Extra attributes, mirroring the engine save format:
+        -- VitalShield (UEquipment.CurrentVitalShield), and container contents
+        -- (UHeldContainerEquipmentItem.Contents → RemainingFillCharges +
+        -- ContentItemData). Properties absent on other item classes simply
+        -- fail the pcall reads and are skipped.
+        local extra_parts = ""
+        local ok_vs, vs = pcall(function()
+            return tonumber(slot:GetPropertyValue("CurrentVitalShield"))
+        end)
+        if ok_vs and vs then
+            extra_parts = extra_parts .. string.format(',"VitalShield":%g', vs)
+        end
+
+        local content_pid, content_qty = "", nil
+        local ok_ct, ct = pcall(function() return slot:GetPropertyValue("Contents") end)
+        if ok_ct and ct ~= nil then
+            local ok_cd, cd = pcall(function() return ct:GetPropertyValue("ContentData") end)
+            if not (ok_cd and cd ~= nil) then
+                ok_cd, cd = pcall(function() return ct.ContentData end)
+            end
+            if ok_cd and cd ~= nil then
+                local ok_iv, iv = pcall(function() return cd:IsValid() end)
+                if ok_iv and iv then content_pid = get_persistence_id(cd) end
+            end
+            local ok_q, q = pcall(function() return tonumber(ct:GetPropertyValue("Quantity")) end)
+            if not (ok_q and q) then
+                ok_q, q = pcall(function() return tonumber(ct.Quantity) end)
+            end
+            if ok_q and q then content_qty = q end
+        end
+        -- Fallback: the item's persistence mirror fields.
+        if content_pid == "" then
+            local ok_cp, cp = pcall(function() return slot:GetPropertyValue("ContentPersistenceID") end)
+            if ok_cp and cp ~= nil then
+                if type(cp) == "string" then content_pid = cp
+                else pcall(function() content_pid = tostring(cp:ToString()) end) end
+            end
+        end
+        if not content_qty then
+            local ok_qp, qp = pcall(function()
+                return tonumber(slot:GetPropertyValue("Quantity_Persistence"))
+            end)
+            if ok_qp and qp then content_qty = qp end
+        end
+        if content_qty then
+            extra_parts = extra_parts .. string.format(',"RemainingFillCharges":%d', content_qty)
+        end
+        if content_pid ~= "" and content_pid ~= "None" then
+            extra_parts = extra_parts .. string.format(',"ContentItemData":"%s"', content_pid)
+        end
+
         local json_idx = i - 1
         -- ENGINE FORMAT: GUID as b64url, ItemData as PersistenceID. Falls back
         -- to legacy hex/path when conversion isn't possible (restore handles both).
         local b64_guid = guid_hex_to_b64(guid_str)
         parts[#parts + 1] = string.format(
-            ',"%d":{"GUID":"%s","ItemData":"%s","Count":%d%s}',
+            ',"%d":{"GUID":"%s","ItemData":"%s","Count":%d%s%s}',
             json_idx,
             b64_guid or guid_str,
             (persist_id ~= "" and persist_id or item_data_str):gsub('"', '\\"'),
             count_val,
-            durability_part)
+            durability_part,
+            extra_parts)
         if item_data_str ~= "" then
             sidecar_parts[#sidecar_parts + 1] = string.format(
                 '%s"%d":"%s"', (#sidecar_parts > 0 and "," or ""),
@@ -826,6 +881,14 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
                     tonumber(rec.Count) or 1)
                 local dur = tonumber(rec.Durability)
                 if dur then frag = frag .. string.format(',"Durability":%d', dur) end
+                local vsh = tonumber(rec.VitalShield)
+                if vsh then frag = frag .. string.format(',"VitalShield":%g', vsh) end
+                local rfc = tonumber(rec.RemainingFillCharges)
+                if rfc then frag = frag .. string.format(',"RemainingFillCharges":%d', rfc) end
+                if rec.ContentItemData and rec.ContentItemData ~= "" then
+                    frag = frag .. string.format(',"ContentItemData":"%s"',
+                        tostring(rec.ContentItemData):gsub('"', '\\"'))
+                end
                 frag = frag .. "}"
                 local pos = to_write:find(',"MaxSlotIndex"', 1, true)
                 if pos then
@@ -1197,6 +1260,9 @@ local function restore_inventory(guid, comp, restore_json)
                 FailedRestoreSlots[guid][key] = {
                     GUID = slot_data.GUID, ItemData = slot_data.ItemData,
                     Count = slot_data.Count, Durability = slot_data.Durability,
+                    VitalShield = slot_data.VitalShield,
+                    RemainingFillCharges = slot_data.RemainingFillCharges,
+                    ContentItemData = slot_data.ContentItemData,
                     Path = path,
                 }
                 goto next_slot
@@ -1221,6 +1287,9 @@ local function restore_inventory(guid, comp, restore_json)
                 FailedRestoreSlots[guid][key] = {
                     GUID = slot_data.GUID, ItemData = slot_data.ItemData,
                     Count = slot_data.Count, Durability = slot_data.Durability,
+                    VitalShield = slot_data.VitalShield,
+                    RemainingFillCharges = slot_data.RemainingFillCharges,
+                    ContentItemData = slot_data.ContentItemData,
                     Path = path,
                 }
                 goto next_slot
@@ -1246,6 +1315,68 @@ local function restore_inventory(guid, comp, restore_json)
                     pcall(function() it:SetPropertyValue("Durability", dur) end)
                     pcall(function() it:OnRep_Durability() end)
                     log("restore: slot " .. idx .. " Durability set to " .. dur)
+                end
+
+                -- VitalShield (UEquipment.CurrentVitalShield).
+                local vshield = tonumber(slot_data.VitalShield)
+                if vshield then
+                    pcall(function() it:SetPropertyValue("CurrentVitalShield", vshield) end)
+                    log("restore: slot " .. idx .. " VitalShield set to " .. vshield)
+                end
+
+                -- Container contents (buckets / watering cans):
+                -- RemainingFillCharges → Contents.Quantity, ContentItemData →
+                -- Contents.ContentData (resolved by PersistenceID).
+                local fill_qty = tonumber(slot_data.RemainingFillCharges)
+                local content_id = slot_data.ContentItemData
+                if fill_qty or (content_id and content_id ~= "") then
+                    local content_obj = nil
+                    if content_id and content_id ~= "" then
+                        content_obj = find_item_by_persistence_id(content_id)
+                        if not content_obj then
+                            log_err("restore: slot " .. idx .. " content asset not found for PID "
+                                .. tostring(content_id))
+                        end
+                    end
+                    -- Attempt 1: whole-struct write from a table.
+                    local ok_cw = pcall(function()
+                        it:SetPropertyValue("Contents", {
+                            ContentData = content_obj,
+                            Quantity    = fill_qty or 0,
+                        })
+                    end)
+                    -- Verify; fall back to field-level writes on the struct proxy.
+                    local function read_qty()
+                        local ok_ct, ct = pcall(function() return it:GetPropertyValue("Contents") end)
+                        if not (ok_ct and ct) then return nil end
+                        local ok_q, q = pcall(function() return tonumber(ct:GetPropertyValue("Quantity")) end)
+                        if ok_q and q then return q end
+                        local ok_q2, q2 = pcall(function() return tonumber(ct.Quantity) end)
+                        return ok_q2 and q2 or nil
+                    end
+                    if fill_qty and read_qty() ~= fill_qty then
+                        local ok_ct, ct = pcall(function() return it:GetPropertyValue("Contents") end)
+                        if ok_ct and ct then
+                            pcall(function() ct.Quantity = fill_qty end)
+                            pcall(function() ct:SetPropertyValue("Quantity", fill_qty) end)
+                            if content_obj then
+                                pcall(function() ct.ContentData = content_obj end)
+                                pcall(function() ct:SetPropertyValue("ContentData", content_obj) end)
+                            end
+                        end
+                    end
+                    -- Keep the persistence mirror fields in sync as well.
+                    if content_id and content_id ~= "" then
+                        pcall(function() it:SetPropertyValue("ContentPersistenceID", content_id) end)
+                    end
+                    if fill_qty then
+                        pcall(function() it:SetPropertyValue("Quantity_Persistence", fill_qty) end)
+                    end
+                    pcall(function() it:OnRep_Contents() end)
+                    log(string.format(
+                        "restore: slot %d contents — struct-write ok=%s qty-readback=%s content=%s",
+                        idx, tostring(ok_cw), tostring(read_qty()),
+                        tostring(content_obj ~= nil)))
                 end
             end
         end

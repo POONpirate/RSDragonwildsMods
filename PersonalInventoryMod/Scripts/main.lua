@@ -78,9 +78,25 @@ local MOD_LOG_PATH = "ue4ss/Mods/" .. MOD_NAME .. "/" .. MOD_NAME .. ".log"
 local mod_log_file = io.open(MOD_LOG_PATH, "w")  -- truncate per session
 
 local function write_mod_log(line)
+    local text = os.date("[%H:%M:%S] ") .. line .. "\n"
+    -- io write fails SILENTLY (returns nil) if the handle goes bad — e.g. when
+    -- an external tool locks the file. Detect and reopen in append mode so the
+    -- log never quietly stops mid-session.
     if mod_log_file then
-        mod_log_file:write(os.date("[%H:%M:%S] ") .. line .. "\n")
-        mod_log_file:flush()
+        local ok = pcall(function()
+            assert(mod_log_file:write(text))
+            mod_log_file:flush()
+        end)
+        if ok then return end
+        pcall(function() mod_log_file:close() end)
+        mod_log_file = nil
+    end
+    mod_log_file = io.open(MOD_LOG_PATH, "a")
+    if mod_log_file then
+        pcall(function()
+            mod_log_file:write("[logger reopened]\n" .. text)
+            mod_log_file:flush()
+        end)
     end
 end
 
@@ -658,14 +674,14 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
 
     if not to_write then
         log("save: inventory is empty — nothing written for GUID " .. guid)
-        return
+        return nil
     end
 
     local path = json_path(guid)
     local file = io.open(path, "w")
     if not file then
         log_err("Could not open save file for writing: " .. path)
-        return
+        return to_write
     end
     file:write(to_write)
     file:close()
@@ -680,6 +696,7 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
             log("Saved paths sidecar (" .. #sidecar_json .. " bytes).")
         end
     end
+    return to_write
 end
 
 local function save_all_inventories()
@@ -881,6 +898,180 @@ local function open_second_inventory_ui(ctrl, second_inv, char_obj)
 end
 
 -- -----------------------------------------------------------------------------
+-- Controller / GUID resolution helpers
+-- -----------------------------------------------------------------------------
+
+local function find_local_controller()
+    local ok_all, all_ctrls = pcall(FindAllOf, "DominionPlayerController")
+    if not ok_all or not all_ctrls then return nil end
+    for _, c in ipairs(all_ctrls) do
+        if c:IsValid() then
+            local ok_l, is_l = pcall(function() return c:IsLocalController() end)
+            if ok_l and is_l then return c end
+        end
+    end
+    for _, c in ipairs(all_ctrls) do
+        if c:IsValid() then return c end
+    end
+    return nil
+end
+
+local function resolve_character_guid(ctrl)
+    local ok_guid, guid_struct = pcall(function() return ctrl:GetCharacterGuid() end)
+    if not ok_guid or not guid_struct then return nil end
+    local ok_ig, ig = pcall(function() return guid_struct.InnerGuid end)
+    if not ok_ig or ig == nil then return nil end
+    if type(ig) == "string" then
+        return ig ~= "" and ig or nil
+    end
+    local ok_ts, ts = pcall(function() return ig:ToString() end)
+    if ok_ts and ts and ts ~= "" then return ts end
+    local ok_f, s = pcall(function()
+        return string.format("%08X%08X%08X%08X", ig.A or 0, ig.B or 0, ig.C or 0, ig.D or 0)
+    end)
+    if ok_f and s and s ~= EMPTY_GUID then return s end
+    return nil
+end
+
+-- -----------------------------------------------------------------------------
+-- Restore: broadcast engine-format JSON, then engine-add any missing slots
+-- -----------------------------------------------------------------------------
+
+local function scan_occupied_slots(comp)
+    local set, list = {}, {}
+    local ok_sv, sv = pcall(function() return comp:GetPropertyValue("ItemSlots") end)
+    if not (ok_sv and sv) then return set, list end
+    for si = 1, SECOND_INV_SLOTS do
+        local ok_ssl, ssl = pcall(function() return sv[si] end)
+        if not (ok_ssl and ssl) then break end
+        local ok_sg, sg = pcall(function() return ssl:GetPropertyValue("GUID") end)
+        local shex = (ok_sg and sg) and norm_guid_hex(read_fguid(sg)) or ""
+        if shex ~= "" and shex ~= EMPTY_GUID then
+            set[si - 1] = true
+            list[#list + 1] = si - 1
+        end
+    end
+    return set, list
+end
+
+local function restore_inventory(guid, comp, restore_json)
+    -- 1. Engine-native path: set JsonInventory + OnInventoryLoadedFromSave
+    --    broadcast. With engine-format JSON (b64 GUIDs + PersistenceIDs) the
+    --    engine should rebuild ItemSlots itself.
+    populate_inventory(comp, restore_json)
+
+    local occ_set, occ_list = scan_occupied_slots(comp)
+    log("restore: occupied slots after broadcast = " .. #occ_list
+        .. (#occ_list > 0 and (" [" .. table.concat(occ_list, ",") .. "]") or ""))
+
+    local ok_dec, parsed = pcall(json.decode, restore_json)
+    if not ok_dec then
+        log_err("restore: json.decode failed: " .. tostring(parsed))
+        parsed = nil
+    end
+
+    -- Paths sidecar (engine-format saves keep asset paths here).
+    local sidecar = {}
+    pcall(function()
+        local pf = io.open(paths_path(guid), "r")
+        if pf then
+            local c = pf:read("*a")
+            pf:close()
+            local ok_p, p = pcall(json.decode, c)
+            if ok_p and type(p) == "table" then sidecar = p end
+        end
+    end)
+
+    -- Make sure AllowAdds isn't blocking the engine add functions.
+    pcall(function() comp:SetPropertyValue("AllowAdds", true) end)
+
+    -- 2. Fallback: any slot the engine didn't fill gets restored through the
+    --    engine's own add functions.
+    for key, slot_data in pairs(parsed or {}) do
+        local idx = tonumber(key)
+        if idx and type(slot_data) == "table"
+           and slot_data.GUID and slot_data.GUID ~= "" then
+            if occ_set[idx] then
+                log("restore: slot " .. idx .. " already restored by engine.")
+                goto next_slot
+            end
+
+            -- Resolve the item asset: legacy path in ItemData, sidecar path,
+            -- or PersistenceID scan of loaded assets.
+            local idat = tostring(slot_data.ItemData or "")
+            local path = (idat:sub(1, 1) == "/") and idat or sidecar[key]
+            local found = nil
+            if path and path ~= "" then
+                for _, tp in ipairs({ path, path .. "_C" }) do
+                    local ok_fo, fo = pcall(StaticFindObject, tp)
+                    if ok_fo and fo and fo:IsValid() then
+                        found = fo
+                        break
+                    end
+                end
+                if not found then
+                    pcall(function() LoadAsset(path) end)
+                    local ok_fo, fo = pcall(StaticFindObject, path)
+                    if ok_fo and fo and fo:IsValid() then found = fo end
+                end
+            end
+            if not found and idat ~= "" and idat:sub(1, 1) ~= "/" then
+                found = find_item_by_persistence_id(idat)
+                if found then
+                    log("restore: slot " .. idx .. " resolved via PersistenceID scan.")
+                end
+            end
+            if not found then
+                log_err("restore: slot " .. idx .. ": cannot resolve item ("
+                    .. idat:sub(1, 60) .. ")")
+                goto next_slot
+            end
+
+            -- Engine-native add. Signature unknown — try likely arg orders and
+            -- verify by re-scanning slot occupancy after each call.
+            local cnt = tonumber(slot_data.Count) or 1
+            local attempts = {
+                { "AddItemByDataToSlot", { found, idx, cnt } },
+                { "AddItemByDataToSlot", { found, cnt, idx } },
+                { "AddItemByData",       { found, cnt } },
+            }
+            local added = false
+            for _, att in ipairs(attempts) do
+                local fname, args = att[1], att[2]
+                local ok_call, ret = pcall(function()
+                    return comp[fname](comp, table.unpack(args))
+                end)
+                log(string.format("restore: slot %d %s(#%d args) ok=%s ret=%s",
+                    idx, fname, #args, tostring(ok_call), tostring(ret)))
+                local now_set = scan_occupied_slots(comp)
+                if now_set[idx] then
+                    added = true
+                    log("restore: slot " .. idx .. " now occupied via " .. fname)
+                    break
+                end
+                if ok_call and (ret == true or (tonumber(ret) or 0) > 0) then
+                    added = true
+                    log("restore: " .. fname .. " reported success (slot may differ).")
+                    break
+                end
+            end
+            if not added then
+                log_err("restore: slot " .. idx .. " could not be filled by engine adds.")
+            end
+        end
+        ::next_slot::
+    end
+
+    local _, final_list = scan_occupied_slots(comp)
+    log("restore: occupied slots after restore = " .. #final_list
+        .. (#final_list > 0 and (" [" .. table.concat(final_list, ",") .. "]") or ""))
+
+    -- Nudge replication/UI.
+    local ok_rep = pcall(function() comp:OnRep_ItemSlots() end)
+    log("restore: OnRep_ItemSlots() = " .. tostring(ok_rep))
+end
+
+-- -----------------------------------------------------------------------------
 -- Game-save hooks
 -- -----------------------------------------------------------------------------
 
@@ -944,144 +1135,7 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                             local ok_v, is_v = pcall(function() return comp:IsValid() end)
                             if ok_v and is_v then
                                 log("OPI post-hook: restoring items for GUID=" .. guid:sub(1, 16) .. "...")
-                                populate_inventory(comp, restore_json)
-                                log("OPI post-hook: restore broadcast sent.")
-
-                                -- Restore strategy (2026-06-09):
-                                -- 1. Broadcast already fired above. If the save is engine format
-                                --    (b64 GUIDs + PersistenceIDs) the engine may restore natively —
-                                --    the occupancy scan below tells us.
-                                -- 2. Any slot still empty gets restored via the engine's own add
-                                --    functions (AddItemByDataToSlot etc., found via FNDUMP), with the
-                                --    asset resolved from the paths sidecar / legacy path / PersistenceID.
-                                -- NOTE: direct struct writes are DEAD — UE4SS returns FItemSlot copies.
-                                local function scan_occupied()
-                                    local set, list = {}, {}
-                                    local ok_sv, sv = pcall(function()
-                                        return comp:GetPropertyValue("ItemSlots")
-                                    end)
-                                    if not (ok_sv and sv) then return set, list end
-                                    for si = 1, SECOND_INV_SLOTS do
-                                        local ok_ssl, ssl = pcall(function() return sv[si] end)
-                                        if not (ok_ssl and ssl) then break end
-                                        local ok_sg, sg = pcall(function() return ssl:GetPropertyValue("GUID") end)
-                                        local shex = (ok_sg and sg) and norm_guid_hex(read_fguid(sg)) or ""
-                                        if shex ~= "" and shex ~= EMPTY_GUID then
-                                            set[si - 1] = true
-                                            list[#list + 1] = si - 1
-                                        end
-                                    end
-                                    return set, list
-                                end
-
-                                local occ_set, occ_list = scan_occupied()
-                                log("OPI fix: occupied slots after broadcast = " .. #occ_list
-                                    .. (#occ_list > 0 and (" [" .. table.concat(occ_list, ",") .. "]") or ""))
-
-                                local ok_dec, parsed = pcall(json.decode, restore_json)
-                                if not ok_dec then
-                                    log_err("OPI fix: json.decode failed: " .. tostring(parsed))
-                                    parsed = nil
-                                end
-
-                                -- Paths sidecar (engine-format saves keep asset paths here).
-                                local sidecar = {}
-                                pcall(function()
-                                    local pf = io.open(paths_path(guid), "r")
-                                    if pf then
-                                        local c = pf:read("*a")
-                                        pf:close()
-                                        local ok_p, p = pcall(json.decode, c)
-                                        if ok_p and type(p) == "table" then sidecar = p end
-                                    end
-                                end)
-
-                                -- Make sure AllowAdds isn't blocking the engine add functions.
-                                pcall(function() comp:SetPropertyValue("AllowAdds", true) end)
-
-                                for key, slot_data in pairs(parsed or {}) do
-                                    local idx = tonumber(key)
-                                    if idx and type(slot_data) == "table"
-                                       and slot_data.GUID and slot_data.GUID ~= "" then
-                                        if occ_set[idx] then
-                                            log("OPI fix: slot " .. idx .. " already restored by engine.")
-                                            goto next_slot
-                                        end
-
-                                        -- Resolve the item asset: legacy path in ItemData, sidecar
-                                        -- path, or PersistenceID scan of loaded assets.
-                                        local idat = tostring(slot_data.ItemData or "")
-                                        local path = (idat:sub(1, 1) == "/") and idat or sidecar[key]
-                                        local found = nil
-                                        if path and path ~= "" then
-                                            for _, tp in ipairs({ path, path .. "_C" }) do
-                                                local ok_fo, fo = pcall(StaticFindObject, tp)
-                                                if ok_fo and fo and fo:IsValid() then
-                                                    found = fo
-                                                    break
-                                                end
-                                            end
-                                            if not found then
-                                                pcall(function() LoadAsset(path) end)
-                                                local ok_fo, fo = pcall(StaticFindObject, path)
-                                                if ok_fo and fo and fo:IsValid() then found = fo end
-                                            end
-                                        end
-                                        if not found and idat ~= "" and idat:sub(1, 1) ~= "/" then
-                                            found = find_item_by_persistence_id(idat)
-                                            if found then
-                                                log("OPI fix: slot " .. idx .. " resolved via PersistenceID scan.")
-                                            end
-                                        end
-                                        if not found then
-                                            log_err("OPI fix: slot " .. idx .. ": cannot resolve item ("
-                                                .. idat:sub(1, 60) .. ")")
-                                            goto next_slot
-                                        end
-
-                                        -- Engine-native add. Signature unknown — try likely arg orders
-                                        -- and verify by re-scanning slot occupancy after each call.
-                                        local cnt = tonumber(slot_data.Count) or 1
-                                        local attempts = {
-                                            { "AddItemByDataToSlot", { found, idx, cnt } },
-                                            { "AddItemByDataToSlot", { found, cnt, idx } },
-                                            { "AddItemByData",       { found, cnt } },
-                                        }
-                                        local added = false
-                                        for _, att in ipairs(attempts) do
-                                            local fname, args = att[1], att[2]
-                                            local ok_call, ret = pcall(function()
-                                                return comp[fname](comp, table.unpack(args))
-                                            end)
-                                            log(string.format("OPI fix: slot %d %s(#%d args) ok=%s ret=%s",
-                                                idx, fname, #args, tostring(ok_call), tostring(ret)))
-                                            local now_set = scan_occupied()
-                                            if now_set[idx] then
-                                                added = true
-                                                log("OPI fix: slot " .. idx .. " now occupied via " .. fname)
-                                                break
-                                            end
-                                            if ok_call and (ret == true or (tonumber(ret) or 0) > 0) then
-                                                added = true
-                                                log("OPI fix: " .. fname .. " reported success (slot may differ).")
-                                                break
-                                            end
-                                        end
-                                        if not added then
-                                            log_err("OPI fix: slot " .. idx .. " could not be filled by engine adds.")
-                                        end
-                                    end
-                                    ::next_slot::
-                                end
-
-                                local _, final_list = scan_occupied()
-                                log("OPI fix: occupied slots after restore = " .. #final_list
-                                    .. (#final_list > 0 and (" [" .. table.concat(final_list, ",") .. "]") or ""))
-
-                                -- Try OnRep_ItemSlots to nudge the UI into re-rendering.
-                                local ok_rep = pcall(function() comp:OnRep_ItemSlots() end)
-                                log("OPI fix: OnRep_ItemSlots() = " .. tostring(ok_rep))
-
+                                restore_inventory(guid, comp, restore_json)
                                 any = true
                             else
                                 log("OPI post-hook: comp invalid for GUID=" .. guid:sub(1, 16))
@@ -1193,59 +1247,26 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                     ExecuteInGameThread(function()
                         log("Eye of Oculus cast — finding local player controller...")
 
-                        local all_ctrls = FindAllOf("DominionPlayerController")
-                        if not all_ctrls or #all_ctrls == 0 then
-                            log_err("FindAllOf returned no DominionPlayerController instances.")
-                            return
-                        end
-
-                        local ctrl = nil
-                        for _, c in ipairs(all_ctrls) do
-                            if c:IsValid() then
-                                local ok_local, is_local = pcall(function() return c:IsLocalController() end)
-                                if ok_local and is_local then ctrl = c break end
-                            end
-                        end
-                        if not ctrl then
-                            for _, c in ipairs(all_ctrls) do
-                                if c:IsValid() then ctrl = c break end
-                            end
-                        end
+                        local ctrl = find_local_controller()
                         if not ctrl then
                             log_err("No valid DominionPlayerController found.")
                             return
                         end
 
-                        -- Resolve GUID.
-                        local ok_guid, guid_struct = pcall(function() return ctrl:GetCharacterGuid() end)
-                        if not ok_guid or not guid_struct then
-                            log_err("GetCharacterGuid failed: " .. tostring(guid_struct))
-                            return
-                        end
-                        local ig = guid_struct.InnerGuid
-                        local guid
-                        if type(ig) == "string" then
-                            guid = ig
-                        else
-                            local ok_ts, ts = pcall(function() return ig:ToString() end)
-                            if ok_ts and ts and ts ~= "" then
-                                guid = ts
-                            else
-                                guid = string.format("%08X%08X%08X%08X",
-                                    ig.A or 0, ig.B or 0, ig.C or 0, ig.D or 0)
-                            end
-                        end
-                        if not guid or guid == "" then
-                            log_err("Could not resolve GUID.")
+                        local guid = resolve_character_guid(ctrl)
+                        if not guid then
+                            log_err("Could not resolve character GUID.")
                             return
                         end
                         log("Controller found, GUID=" .. guid)
                         ControllersByGuid[guid] = ctrl
 
                         -- Spy on all PersonalInventoryComponents to learn real JSON format.
-                        -- The real chest's JsonInventory shows us what valid ItemData looks like.
-                        -- Only log the first time (or first few times) to avoid log spam.
-                        if _probe_cast <= 5 then
+                        -- DISABLED 2026-06-09: served its purpose (PersistenceID property found,
+                        -- UFunction list captured, GUID encoding confirmed). Both logs went dark
+                        -- mid-spy on runs 3/4, so this block is also the prime crash suspect.
+                        local SPY_ENABLED = false
+                        if SPY_ENABLED and _probe_cast <= 5 then
                             local ok_all, all_pics = pcall(function()
                                 return FindAllOf("PersonalInventoryComponent")
                             end)
@@ -1429,66 +1450,33 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                         local second_inv = get_or_create_second_inventory(guid, ctrl)
                         if not second_inv then return end
 
-                        -- Persist on every open so items are never lost between sessions.
-                        -- On first cast the component is freshly constructed (no items) so
-                        -- save_inventory_data writes nothing.  On second+ cast this captures
-                        -- everything placed since the last save.
-                        save_inventory_data(guid, second_inv, CachedInventoryJson[guid])
+                        -- ARCHITECTURE (2026-06-09): restore happens ONCE at game load (see the
+                        -- load-time restore loop below). The live component owns the state from
+                        -- then on; casts only persist + sync + open the UI.
 
-                        -- JsonInventory controls grid layout (how many slots the UI renders).
-                        -- ItemSlots holds actual item data and persists in-memory on the
-                        -- component between casts. The engine does NOT update JsonInventory
-                        -- when items are dragged in — only during game serialization/save.
-                        --
-                        -- On the very first open after loading (disk save exists), we restore
-                        -- by calling populate_inventory, which sets JsonInventory and fires
-                        -- OnInventoryLoadedFromSave:Broadcast() so the engine rebuilds ItemSlots.
-                        -- LoadedFromDisk prevents re-loading on subsequent casts, which would
-                        -- overwrite any items moved since the last restore.
-                        --
-                        -- When there is no disk save (or already restored), we only update
-                        -- JsonInventory via SetPropertyValue (no broadcast) to keep the 40-slot
-                        -- grid visible without touching the live ItemSlots array.
-
-                        local saved = (not LoadedFromDisk[guid]) and load_inventory_data(guid)
-                        if saved then
-                            -- Set JsonInventory now so OpenPersonalInventory sees the right slot
-                            -- count (MaxSlotIndex:39) when it initialises the UI grid.
-                            -- We also queue the data in PendingRestoreData so the OPI post-hook
-                            -- can call populate_inventory AGAIN after OpenPersonalInventory runs —
-                            -- because OPI internally clears/reinitialises ItemSlots, wiping items
-                            -- that were placed by the Broadcast we fired here.
-                            populate_inventory(second_inv, saved)
-                            PendingRestoreData[guid] = saved
+                        -- Cast-time fallback: if the load-time restore hasn't run yet (slow
+                        -- load, race), restore now before opening.
+                        if not LoadedFromDisk[guid] then
                             LoadedFromDisk[guid] = true
-                            log("Disk save loaded — queued post-OPI restore for GUID=" .. guid:sub(1, 16) .. "...")
-                        else
-                            -- Broadcast with SLOT_LAYOUT_JSON (MaxSlotIndex:39, no item entries)
-                            -- on EVERY cast.  Goal: engine's OnInventoryLoadedFromSave handler
-                            -- should call ItemSlots.SetNum(40) non-destructively, expanding the
-                            -- array back to 40 slots after the game trimmed it on item placement.
-                            -- If items disappear after this, the handler clears on broadcast and
-                            -- we need a different approach.
-                            populate_inventory(second_inv, SLOT_LAYOUT_JSON)
-                            log("Broadcast SLOT_LAYOUT_JSON — testing non-destructive SetNum(40).")
-
-                            -- Diagnostic: probe TArray indexing (0-based vs 1-based) and slot count.
-                            local ok_s, sv = pcall(function()
-                                return second_inv:GetPropertyValue("ItemSlots")
-                            end)
-                            if ok_s and sv ~= nil then
-                                local ok0,  s0  = pcall(function() return sv[0]  end)
-                                local ok1,  s1  = pcall(function() return sv[1]  end)
-                                local ok39, s39 = pcall(function() return sv[39] end)
-                                local ok40, s40 = pcall(function() return sv[40] end)
-                                log(string.format(
-                                    "ItemSlots idx: [0]=%s [1]=%s [39]=%s [40]=%s",
-                                    ok0  and type(s0)  or "err",
-                                    ok1  and type(s1)  or "err",
-                                    ok39 and type(s39) or "err",
-                                    ok40 and type(s40) or "err"))
+                            local saved = load_inventory_data(guid)
+                            if saved then
+                                log("Cast-time fallback restore (load-time restore hadn't run).")
+                                restore_inventory(guid, second_inv, saved)
                             end
                         end
+
+                        -- Persist on every open so items are never lost between sessions.
+                        local current_json = save_inventory_data(guid, second_inv, CachedInventoryJson[guid])
+
+                        -- Keep JsonInventory = full engine-format inventory (items + MaxSlotIndex:39).
+                        -- If OpenPersonalInventory rebuilds ItemSlots from JsonInventory, this
+                        -- reproduces the items instead of wiping them, and keeps the 40-slot grid.
+                        -- No broadcast — the live ItemSlots array is the source of truth.
+                        local sync_json = current_json or SLOT_LAYOUT_JSON
+                        local ok_sync = pcall(function()
+                            second_inv:SetPropertyValue("JsonInventory", sync_json)
+                        end)
+                        log("JsonInventory synced pre-open (" .. #sync_json .. " bytes, ok=" .. tostring(ok_sync) .. ").")
 
                         open_second_inventory_ui(ctrl, second_inv, char_obj)
                     end)
@@ -1503,6 +1491,69 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
         else
             hook_registered = true
             log("All hooks registered. Waiting for Eye of Oculus cast.")
+        end
+
+        -- -----------------------------------------------------------------------
+        -- Load-time restore
+        -- Populate the second inventory from the saved JSON as soon as the
+        -- character is fully loaded, then let the game manage it in memory.
+        -- Polls every 2s (up to 60s) until controller + character + GUID resolve.
+        -- -----------------------------------------------------------------------
+        local load_restore_done  = false
+        local load_restore_tries = 0
+        local ok_loop = pcall(function()
+            LoopAsync(2000, function()
+                if load_restore_done then return true end
+                load_restore_tries = load_restore_tries + 1
+                if load_restore_tries > 30 then
+                    log_err("Load-time restore: timed out waiting for character.")
+                    return true
+                end
+                ExecuteInGameThread(function()
+                    if load_restore_done then return end
+
+                    local ctrl = find_local_controller()
+                    if not ctrl then return end
+                    local guid = resolve_character_guid(ctrl)
+                    if not guid then return end
+
+                    -- Wait for the player character too — its presence means the
+                    -- save data is loaded and components are safe to construct.
+                    local char_ok = false
+                    local ok_ch, chars = pcall(FindAllOf, "DominionPlayerCharacter")
+                    if ok_ch and chars then
+                        for _, ch in ipairs(chars) do
+                            if ch:IsValid() then char_ok = true break end
+                        end
+                    end
+                    if not char_ok then return end
+
+                    load_restore_done = true
+                    if LoadedFromDisk[guid] then return end
+                    LoadedFromDisk[guid] = true
+                    ControllersByGuid[guid] = ctrl
+
+                    local saved = load_inventory_data(guid)
+                    if not saved then
+                        log("Load-time restore: no save file — nothing to restore.")
+                        return
+                    end
+
+                    local comp = get_or_create_second_inventory(guid, ctrl)
+                    if not comp then
+                        log_err("Load-time restore: component construction failed.")
+                        return
+                    end
+
+                    log("Load-time restore: populating second inventory from disk...")
+                    restore_inventory(guid, comp, saved)
+                    log("Load-time restore: complete.")
+                end)
+                return load_restore_done
+            end)
+        end)
+        if not ok_loop then
+            log_err("LoopAsync unavailable — load-time restore will run on first cast instead.")
         end
     end)
 end)

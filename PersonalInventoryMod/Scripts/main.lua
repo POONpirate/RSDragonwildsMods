@@ -243,6 +243,58 @@ local function b64_guid_hex_views(s)
     return "raw=" .. straight .. " le32=" .. table.concat(le_parts)
 end
 
+-- Convert a 32-hex FGuid string to the engine save format (unpadded base64url
+-- of the same 16 bytes). CONFIRMED: live hex GUIDs match CharacterSave b64
+-- values byte-for-byte with no swizzle.
+local function guid_hex_to_b64(hex)
+    hex = norm_guid_hex(hex)
+    if #hex ~= 32 then return nil end
+    local bytes = (hex:gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end))
+    return b64url_encode(bytes)
+end
+
+-- Sidecar file holding slot-index → asset path, written alongside the main
+-- save. The engine ignores it; we use it to resolve assets for the fallback
+-- restore path (engine format stores only PersistenceIDs).
+local function paths_path(guid)
+    return json_path(guid):gsub("%.json$", "_paths.json")
+end
+
+-- Resolve an item asset by its PersistenceID (b64 string) by scanning loaded
+-- item data assets. Only finds assets already in memory.
+local ITEMDATA_CLASSES = {
+    "ItemData", "HeldEquipmentData", "HeldContainerEquipmentData",
+    "HarvestToolEquipmentData", "EquipmentData",
+}
+local function find_item_by_persistence_id(pid)
+    if not pid or pid == "" then return nil end
+    for _, cls in ipairs(ITEMDATA_CLASSES) do
+        local ok_all, objs = pcall(FindAllOf, cls)
+        if ok_all and objs then
+            for _, o in ipairs(objs) do
+                local ok_pid, pv = pcall(function() return o:GetPropertyValue("PersistenceID") end)
+                if ok_pid and pv ~= nil then
+                    local s = ""
+                    if type(pv) == "string" then s = pv
+                    else pcall(function() s = tostring(pv:ToString()) end) end
+                    if s == pid then return o end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Read an asset's PersistenceID as the b64 string the save format expects.
+local function get_persistence_id(asset)
+    local ok_pid, pv = pcall(function() return asset:GetPropertyValue("PersistenceID") end)
+    if not ok_pid or pv == nil then return "" end
+    if type(pv) == "string" then return pv end
+    local s = ""
+    pcall(function() s = tostring(pv:ToString()) end)
+    return s
+end
+
 -- ---------------------------------------------------------------------------
 -- Force-JSON helpers — try calling component functions that might serialize
 -- ItemSlots back into JsonInventory (the way the game's own save path does).
@@ -365,8 +417,9 @@ local function serialize_item_slots(inv_comp)
     end
 
     -- 3. Walk ItemSlots and build JSON from any occupied (non-zero GUID) slots.
-    local parts   = { '{"Version":67' }
-    local max_idx = -1
+    local parts         = { '{"Version":67' }
+    local sidecar_parts = {}  -- slot idx → asset path (fallback-restore sidecar)
+    local max_idx       = -1
 
     for i = 1, SECOND_INV_SLOTS do
         local ok_slot, slot = pcall(function() return sv[i] end)
@@ -511,13 +564,32 @@ local function serialize_item_slots(inv_comp)
             end
         end
 
+        -- PersistenceID: the b64 GUID string the engine's save format uses for
+        -- ItemData (property on DominionDataAsset, base of all item assets).
+        local persist_id = ""
+        if ok_d and dv ~= nil and type(dv) ~= "string" then
+            persist_id = get_persistence_id(dv)
+        end
+
         local json_idx = i - 1
+        -- ENGINE FORMAT: GUID as b64url, ItemData as PersistenceID. Falls back
+        -- to legacy hex/path when conversion isn't possible (restore handles both).
+        local b64_guid = guid_hex_to_b64(guid_str)
         parts[#parts + 1] = string.format(
             ',"%d":{"GUID":"%s","ItemData":"%s","Count":%d}',
-            json_idx, guid_str, item_data_str:gsub('"', '\\"'), count_val)
+            json_idx,
+            b64_guid or guid_str,
+            (persist_id ~= "" and persist_id or item_data_str):gsub('"', '\\"'),
+            count_val)
+        if item_data_str ~= "" then
+            sidecar_parts[#sidecar_parts + 1] = string.format(
+                '%s"%d":"%s"', (#sidecar_parts > 0 and "," or ""),
+                json_idx, item_data_str:gsub('"', '\\"'))
+        end
         max_idx = json_idx
-        log(string.format("serialize: slot %d  GUID=%s  Count=%d",
-            json_idx, guid_str:sub(1, 16), count_val))
+        log(string.format("serialize: slot %d  GUID=%s  PID=%s  Count=%d",
+            json_idx, tostring(b64_guid or guid_str:sub(1, 16)),
+            persist_id ~= "" and persist_id or "(path)", count_val))
 
         ::continue::
     end
@@ -527,10 +599,12 @@ local function serialize_item_slots(inv_comp)
         return nil
     end
 
-    parts[#parts + 1] = string.format(',"MaxSlotIndex":%d,"AllowAdds":false}', SECOND_INV_SLOTS - 1)
+    -- Mirror the engine's PersonalInventory format exactly (no AllowAdds).
+    parts[#parts + 1] = string.format(',"MaxSlotIndex":%d}', SECOND_INV_SLOTS - 1)
     local result = table.concat(parts)
-    log("serialize: built JSON (" .. #result .. " bytes).")
-    return result
+    local sidecar_json = "{" .. table.concat(sidecar_parts) .. "}"
+    log("serialize: built JSON (" .. #result .. " bytes, engine format).")
+    return result, sidecar_json
 end
 
 -- -----------------------------------------------------------------------------
@@ -555,11 +629,12 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
     if not inv_comp or not inv_comp:IsValid() then return end
 
     local to_write = nil
+    local sidecar_json = nil
 
-    -- Priority 1: manually serialize ItemSlots → JSON.
+    -- Priority 1: manually serialize ItemSlots → JSON (engine format).
     -- This is the primary path because the engine never writes item data back into
     -- JsonInventory for our dynamic component.
-    to_write = serialize_item_slots(inv_comp)
+    to_write, sidecar_json = serialize_item_slots(inv_comp)
 
     -- Priority 2: live JsonInventory (populated if the engine did serialize it).
     if not to_write then
@@ -595,6 +670,16 @@ local function save_inventory_data(guid, inv_comp, fallback_json)
     file:write(to_write)
     file:close()
     log("Saved inventory for GUID " .. guid .. " (" .. #to_write .. " bytes).")
+
+    -- Sidecar: slot → asset path map for the fallback restore.
+    if sidecar_json and sidecar_json ~= "{}" then
+        local pf = io.open(paths_path(guid), "w")
+        if pf then
+            pf:write(sidecar_json)
+            pf:close()
+            log("Saved paths sidecar (" .. #sidecar_json .. " bytes).")
+        end
+    end
 end
 
 local function save_all_inventories()
@@ -862,120 +947,136 @@ NotifyOnNewObject("/Script/Dominion.DominionPlayerController", function(_)
                                 populate_inventory(comp, restore_json)
                                 log("OPI post-hook: restore broadcast sent.")
 
-                                -- Direct slot restore, driven by the saved JSON.
-                                -- CONFIRMED (2026-06-09): the engine's OnInventoryLoadedFromSave parser
-                                -- expects base64url 16-byte GUIDs for both GUID and ItemData (see the
-                                -- real PersonalInventory table in CharacterSave.json). Our hex/asset-path
-                                -- format is rejected wholesale, so the broadcast leaves every slot empty.
-                                -- Until we can write engine-format JSON, bypass the parser: write GUID,
-                                -- ItemData (resolved UObject), and Count directly into ItemSlots.
-                                local ok_sv, sv = pcall(function()
-                                    return comp:GetPropertyValue("ItemSlots")
-                                end)
-                                if ok_sv and sv then
-                                    -- Occupancy scan: did the engine's parser accept the JSON?
-                                    -- (Counts slots with a non-zero GUID right after the broadcast.)
-                                    local occupied = {}
+                                -- Restore strategy (2026-06-09):
+                                -- 1. Broadcast already fired above. If the save is engine format
+                                --    (b64 GUIDs + PersistenceIDs) the engine may restore natively —
+                                --    the occupancy scan below tells us.
+                                -- 2. Any slot still empty gets restored via the engine's own add
+                                --    functions (AddItemByDataToSlot etc., found via FNDUMP), with the
+                                --    asset resolved from the paths sidecar / legacy path / PersistenceID.
+                                -- NOTE: direct struct writes are DEAD — UE4SS returns FItemSlot copies.
+                                local function scan_occupied()
+                                    local set, list = {}, {}
+                                    local ok_sv, sv = pcall(function()
+                                        return comp:GetPropertyValue("ItemSlots")
+                                    end)
+                                    if not (ok_sv and sv) then return set, list end
                                     for si = 1, SECOND_INV_SLOTS do
                                         local ok_ssl, ssl = pcall(function() return sv[si] end)
                                         if not (ok_ssl and ssl) then break end
                                         local ok_sg, sg = pcall(function() return ssl:GetPropertyValue("GUID") end)
                                         local shex = (ok_sg and sg) and norm_guid_hex(read_fguid(sg)) or ""
                                         if shex ~= "" and shex ~= EMPTY_GUID then
-                                            occupied[#occupied + 1] = si - 1
+                                            set[si - 1] = true
+                                            list[#list + 1] = si - 1
                                         end
                                     end
-                                    log("OPI fix: occupied slots after broadcast = " .. #occupied
-                                        .. (#occupied > 0 and (" [" .. table.concat(occupied, ",") .. "]") or ""))
+                                    return set, list
+                                end
 
-                                    local ok_dec, parsed = pcall(json.decode, restore_json)
-                                    if not ok_dec then
-                                        log_err("OPI fix: json.decode failed: " .. tostring(parsed))
-                                        parsed = nil
+                                local occ_set, occ_list = scan_occupied()
+                                log("OPI fix: occupied slots after broadcast = " .. #occ_list
+                                    .. (#occ_list > 0 and (" [" .. table.concat(occ_list, ",") .. "]") or ""))
+
+                                local ok_dec, parsed = pcall(json.decode, restore_json)
+                                if not ok_dec then
+                                    log_err("OPI fix: json.decode failed: " .. tostring(parsed))
+                                    parsed = nil
+                                end
+
+                                -- Paths sidecar (engine-format saves keep asset paths here).
+                                local sidecar = {}
+                                pcall(function()
+                                    local pf = io.open(paths_path(guid), "r")
+                                    if pf then
+                                        local c = pf:read("*a")
+                                        pf:close()
+                                        local ok_p, p = pcall(json.decode, c)
+                                        if ok_p and type(p) == "table" then sidecar = p end
                                     end
-                                    for key, slot_data in pairs(parsed or {}) do
-                                        local idx = tonumber(key)
-                                        if idx and type(slot_data) == "table"
-                                           and slot_data.GUID and slot_data.GUID ~= ""
-                                           and norm_guid_hex(slot_data.GUID) ~= EMPTY_GUID then
-                                            -- Engine-format slots (base64url GUIDs, not 32-hex) are the
-                                            -- engine's job to restore — skip the manual write for those.
-                                            if not slot_data.GUID:match("^[0-9A-Fa-f]+$") or #slot_data.GUID ~= 32 then
-                                                log("OPI fix: slot " .. idx .. " is engine-format — left to engine.")
-                                                goto next_slot
-                                            end
-                                            local i = idx + 1  -- sv[] is 1-based, JSON keys 0-based
-                                            local ok_sl, sl = pcall(function() return sv[i] end)
-                                            if not (ok_sl and sl) then
-                                                log_err(string.format("OPI fix: sv[%d] unavailable", i))
-                                                goto next_slot
-                                            end
+                                end)
 
-                                            -- 1. Resolve the item asset to a live UObject.
-                                            local item_path = slot_data.ItemData or ""
-                                            local found = nil
-                                            for _, try_path in ipairs({ item_path, item_path .. "_C" }) do
-                                                local ok_fo, fo = pcall(StaticFindObject, try_path)
+                                -- Make sure AllowAdds isn't blocking the engine add functions.
+                                pcall(function() comp:SetPropertyValue("AllowAdds", true) end)
+
+                                for key, slot_data in pairs(parsed or {}) do
+                                    local idx = tonumber(key)
+                                    if idx and type(slot_data) == "table"
+                                       and slot_data.GUID and slot_data.GUID ~= "" then
+                                        if occ_set[idx] then
+                                            log("OPI fix: slot " .. idx .. " already restored by engine.")
+                                            goto next_slot
+                                        end
+
+                                        -- Resolve the item asset: legacy path in ItemData, sidecar
+                                        -- path, or PersistenceID scan of loaded assets.
+                                        local idat = tostring(slot_data.ItemData or "")
+                                        local path = (idat:sub(1, 1) == "/") and idat or sidecar[key]
+                                        local found = nil
+                                        if path and path ~= "" then
+                                            for _, tp in ipairs({ path, path .. "_C" }) do
+                                                local ok_fo, fo = pcall(StaticFindObject, tp)
                                                 if ok_fo and fo and fo:IsValid() then
                                                     found = fo
-                                                    log("OPI fix: StaticFindObject OK: " .. try_path)
                                                     break
                                                 end
                                             end
                                             if not found then
-                                                -- Asset not in memory — try LoadAsset (UE4SS ≥2.5, game thread).
-                                                local ok_la, la = pcall(function() return LoadAsset(item_path) end)
-                                                log("OPI fix: LoadAsset attempted = " .. tostring(ok_la))
-                                                if ok_la then
-                                                    local ok_fo2, fo2 = pcall(StaticFindObject, item_path)
-                                                    if ok_fo2 and fo2 and fo2:IsValid() then
-                                                        found = fo2
-                                                        log("OPI fix: StaticFindObject OK after LoadAsset")
-                                                    end
-                                                end
+                                                pcall(function() LoadAsset(path) end)
+                                                local ok_fo, fo = pcall(StaticFindObject, path)
+                                                if ok_fo and fo and fo:IsValid() then found = fo end
                                             end
-                                            if found then
-                                                local ok_set = pcall(function()
-                                                    sl:SetPropertyValue("ItemData", found)
-                                                end)
-                                                local ok_iv2, id_valid2 = pcall(function()
-                                                    return sl:GetPropertyValue("ItemData"):IsValid()
-                                                end)
-                                                log(string.format(
-                                                    "OPI fix: slot %d ItemData set=%s valid-after=%s",
-                                                    idx, tostring(ok_set), tostring(ok_iv2 and id_valid2)))
-                                            else
-                                                log_err("OPI fix: could not resolve asset: " .. tostring(item_path))
-                                            end
-
-                                            -- 2. Write the slot GUID (hex from our save file).
-                                            local ok_gv, gv = pcall(function()
-                                                return sl:GetPropertyValue("GUID")
-                                            end)
-                                            if ok_gv and gv then
-                                                local ok_wg, wg_detail = write_fguid(gv, slot_data.GUID)
-                                                log(string.format("OPI fix: slot %d GUID write ok=%s (%s)",
-                                                    idx, tostring(ok_wg), tostring(wg_detail)))
-                                            else
-                                                log_err(string.format("OPI fix: slot %d GUID unreadable", idx))
-                                            end
-
-                                            -- 3. Write Count.
-                                            local cnt = tonumber(slot_data.Count) or 1
-                                            local ok_c = pcall(function()
-                                                sl:SetPropertyValue("Count", cnt)
-                                            end)
-                                            local ok_rc, rc = pcall(function()
-                                                return tonumber(sl:GetPropertyValue("Count"))
-                                            end)
-                                            log(string.format("OPI fix: slot %d Count=%d set=%s read-back=%s",
-                                                idx, cnt, tostring(ok_c), tostring(ok_rc and rc)))
                                         end
-                                        ::next_slot::
+                                        if not found and idat ~= "" and idat:sub(1, 1) ~= "/" then
+                                            found = find_item_by_persistence_id(idat)
+                                            if found then
+                                                log("OPI fix: slot " .. idx .. " resolved via PersistenceID scan.")
+                                            end
+                                        end
+                                        if not found then
+                                            log_err("OPI fix: slot " .. idx .. ": cannot resolve item ("
+                                                .. idat:sub(1, 60) .. ")")
+                                            goto next_slot
+                                        end
+
+                                        -- Engine-native add. Signature unknown — try likely arg orders
+                                        -- and verify by re-scanning slot occupancy after each call.
+                                        local cnt = tonumber(slot_data.Count) or 1
+                                        local attempts = {
+                                            { "AddItemByDataToSlot", { found, idx, cnt } },
+                                            { "AddItemByDataToSlot", { found, cnt, idx } },
+                                            { "AddItemByData",       { found, cnt } },
+                                        }
+                                        local added = false
+                                        for _, att in ipairs(attempts) do
+                                            local fname, args = att[1], att[2]
+                                            local ok_call, ret = pcall(function()
+                                                return comp[fname](comp, table.unpack(args))
+                                            end)
+                                            log(string.format("OPI fix: slot %d %s(#%d args) ok=%s ret=%s",
+                                                idx, fname, #args, tostring(ok_call), tostring(ret)))
+                                            local now_set = scan_occupied()
+                                            if now_set[idx] then
+                                                added = true
+                                                log("OPI fix: slot " .. idx .. " now occupied via " .. fname)
+                                                break
+                                            end
+                                            if ok_call and (ret == true or (tonumber(ret) or 0) > 0) then
+                                                added = true
+                                                log("OPI fix: " .. fname .. " reported success (slot may differ).")
+                                                break
+                                            end
+                                        end
+                                        if not added then
+                                            log_err("OPI fix: slot " .. idx .. " could not be filled by engine adds.")
+                                        end
                                     end
-                                else
-                                    log_err("OPI fix: ItemSlots unreadable on comp")
+                                    ::next_slot::
                                 end
+
+                                local _, final_list = scan_occupied()
+                                log("OPI fix: occupied slots after restore = " .. #final_list
+                                    .. (#final_list > 0 and (" [" .. table.concat(final_list, ",") .. "]") or ""))
 
                                 -- Try OnRep_ItemSlots to nudge the UI into re-rendering.
                                 local ok_rep = pcall(function() comp:OnRep_ItemSlots() end)
